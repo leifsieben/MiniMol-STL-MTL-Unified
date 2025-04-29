@@ -9,6 +9,7 @@ from minimol_dataset import standardize
 from minimol_models import STL_FFN, MTL_FFN
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from hydra.core.global_hydra import GlobalHydra
+from typing import Sequence, Optional, Union, Tuple
 
 def load_model(
     checkpoint_path: str,
@@ -61,181 +62,138 @@ def load_model(
     model.eval()
     return model
 
+def _ensemble_predict(
+    X: torch.Tensor,
+    checkpoints: Sequence[str],
+    mode: str,
+    device: Optional[str]
+) -> np.ndarray:
+    """
+    Given a feature tensor X of shape (N, D), load each checkpoint,
+    run model(X), and return an array of shape (M, N, T) or (M, N)
+    where M = len(checkpoints), T = #tasks for MTL (1 for STL).
+    """
+    def single_pred(ckpt):
+        m = load_model(ckpt, mode=mode, device=device)
+        with torch.no_grad():
+            out = m(X.to(next(m.parameters()).device))
+            probs = torch.sigmoid(out).cpu().numpy()
+        # ensure shape (N,) or (N, T)
+        return probs
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(checkpoints)) as pool:
+        all_preds = pool.map(single_pred, checkpoints)
+        preds = np.stack(list(all_preds), axis=0)
+    return preds
+
+
 
 def predict_smiles(
     smiles: str,
-    checkpoint_path: str,
+    checkpoints,                 # str or list
     mode: str = 'mtl',
     device: str = None,
-    batch_size: int = 1
-) -> np.ndarray:
+    batch_size: int = 1,
+    aggregated: bool = True      # new!
+) -> Union[np.ndarray, Tuple[np.ndarray,np.ndarray]]:
     """
-    Predict score(s) for a single SMILES string.
-
-    Args:
-      smiles: raw SMILES string
-      checkpoint_path: path to trained model checkpoint
-      mode: 'stl' or 'mtl'
-      device: torch device
-      batch_size: featurizer batch size (ignored for single)
-
-    Returns:
-      numpy array of probabilities (shape () for STL, (T,) for MTL)
+    Predict score(s) for a single SMILES string using one or more checkpoints.
+    If aggregated=True, returns the mean (and optionally std if you change return
+    signature). If aggregated=False, returns the full per-model array.
     """
-    # Standardize
+    # normalize checkpoints to list
+    paths = checkpoints if isinstance(checkpoints, (list,tuple)) else [checkpoints]
+
     std = standardize(smiles)
     if std is None:
         raise ValueError(f"Invalid SMILES: {smiles}")
-        # Clear any existing Hydra initialization to avoid errors
-    # clear any prior Hydra initialization so we can safely re-init
-    gh = GlobalHydra.instance()
-    if gh.is_initialized():
-        gh.clear()
-    featurizer = Minimol(batch_size=batch_size)    
-    feats = featurizer([std])
-    x = torch.stack([f.clone().detach().float() for f in feats])
 
-    # Load model
-    model = load_model(checkpoint_path, mode=mode, device=device)
-    # Predict
-    with torch.no_grad():
-        x = x.to(next(model.parameters()).device)
-        logits = model(x)
-        probs = torch.sigmoid(logits).cpu().numpy()
-    return probs[0] if probs.ndim > 0 else probs
+    gh = GlobalHydra.instance()
+    if gh.is_initialized(): gh.clear()
+
+    feats = Minimol(batch_size=batch_size)([std])
+    X = torch.stack([f.float().clone().detach() for f in feats])
+
+    preds = _ensemble_predict(X, paths, mode, device)  # shape (M, 1) or (M,1,T)
+
+    # collapse model axis
+    if aggregated:
+        mean = preds.mean(axis=0)  # shape (1,) or (1,T)
+        return mean.squeeze(0)     # scalar or (T,)
+    else:
+        return preds.squeeze(1)    # shape (M,) or (M,T)
+
+
 
 
 def predict_df(
     df: pd.DataFrame,
     smiles_col: str,
-    checkpoint_paths,
+    checkpoints,                # str or list
     mode: str = 'mtl',
     aggregated: bool = False,
     batch_size: int = 10000,
     device: str = None
 ) -> pd.DataFrame:
-    """
-    Add prediction columns for each model in an ensemble (or aggregated).
+    paths = checkpoints if isinstance(checkpoints, (list,tuple)) else [checkpoints]
 
-    Args:
-      df: input DataFrame containing SMILES
-      smiles_col: name of column in df
-      checkpoint_paths: str or list of str paths to checkpoints
-      mode: 'stl' or 'mtl'
-      aggregated: if True, return mean/std instead of per-model
-      batch_size: featurizer batch size
-      device: torch device
-
-    Returns:
-      new DataFrame with prediction columns appended
-    """
-    # Ensure list of checkpoints
-    if isinstance(checkpoint_paths, str):
-        paths = [checkpoint_paths]
-    else:
-        paths = list(checkpoint_paths)
-
-    # Standardize SMILES
-    smiles = df[smiles_col].tolist()
-    std_list = [standardize(s) for s in smiles]
     smiles = df[smiles_col].tolist()
     with ProcessPoolExecutor() as pool:
-        std_list = list(pool.map(standardize, smiles)) 
-
-    valid_idx = [i for i, s in enumerate(std_list) if s is not None]
+        std_list = list(pool.map(standardize, smiles))
+    valid_idx = [i for i,s in enumerate(std_list) if s is not None]
     std_valid = [std_list[i] for i in valid_idx]
 
-    # Featurize
     gh = GlobalHydra.instance()
-    if gh.is_initialized():
-        gh.clear()
-    featurizer = Minimol(batch_size=batch_size)    
-    feats_list = featurizer(std_valid)
-    X = torch.stack([f.clone().detach().float() for f in feats_list])
+    if gh.is_initialized(): gh.clear()
 
-    # Predict for each model
-    all_preds = []
-    for ckpt in paths:
-        model = load_model(ckpt, mode=mode, device=device)
-        with torch.no_grad():
-            Xd = X.to(next(model.parameters()).device)
-            logits = model(Xd)
-            probs = torch.sigmoid(logits).cpu().numpy()
-        all_preds.append(probs)
+    feats = Minimol(batch_size=batch_size)(std_valid)
+    X = torch.stack([f.float().clone().detach() for f in feats])
 
-    # helper to do one-model inference
-    def _pred_for_ckpt(ckpt):
-        m = load_model(ckpt, mode=mode, device=device)
-        with torch.no_grad():
-            Xd = X.to(next(m.parameters()).device)
-            logits = m(Xd)
-            return torch.sigmoid(logits).cpu().numpy()
-
-        # Parallelize across the ensemble
-    with ThreadPoolExecutor(max_workers=len(paths)) as pool:
-            all_preds = list(pool.map(_pred_for_ckpt, paths))
- 
-    preds = np.stack(all_preds, axis=0)  # shape (M, N, T) or (M, N)
-    n_models, n_valid = preds.shape[0], preds.shape[1]
-    # tasks dimension
-    T = preds.shape[2] if preds.ndim == 3 else 1
+    preds = _ensemble_predict(X, paths, mode, device)
+    M, N = preds.shape[0], preds.shape[1]
+    T = preds.shape[2] if preds.ndim==3 else 1
 
     out = df.copy()
-    # allocate columns
     if aggregated:
-        mean = preds.mean(axis=0)
-        std = preds.std(axis=0)
-        # for each task
+        mean = preds.mean(axis=0)   # (N,T) or (N,)
+        std  = preds.std(axis=0)
         for t in range(T):
-            col_mean = f"pred_mean_task_{t}"
-            col_std = f"pred_std_task_{t}"
-            out[col_mean] = np.nan
-            out[col_std] = np.nan
+            cm, cs = f"pred_mean_task_{t}", f"pred_std_task_{t}"
+            out[cm], out[cs] = np.nan, np.nan
             for j, idx in enumerate(valid_idx):
-                out.at[idx, col_mean] = mean[j, t] if T>1 else mean[j]
-                out.at[idx, col_std] = std[j, t] if T>1 else std[j]
+                out.at[idx, cm] = mean[j,t] if T>1 else mean[j]
+                out.at[idx, cs] = std[j,t]  if T>1 else std[j]
     else:
-        # per model per task
-        for m in range(n_models):
+        for m in range(M):
             for t in range(T):
                 col = f"pred_model_{m}_task_{t}"
                 out[col] = np.nan
                 for j, idx in enumerate(valid_idx):
-                    val = preds[m, j, t] if T>1 else preds[m, j]
+                    val = preds[m,j,t] if T>1 else preds[m,j]
                     out.at[idx, col] = val
+
     return out
 
 
 def predict_batch(
     smiles_list,
-    checkpoint_paths,
+    checkpoints,
     mode: str = 'mtl',
     aggregated: bool = False,
     batch_size: int = 10000,
     device: str = None,
     output_csv: str = None
 ):
-    """
-    Fast inference on a list of SMILES. Returns DataFrame or saves to CSV.
-
-    Args:
-      smiles_list: list of SMILES strings
-      checkpoint_paths: str or list of checkpoint paths
-      mode: 'stl' or 'mtl'
-      aggregated: whether to compute mean/std
-      batch_size: featurizer batch size
-      device: torch device
-      output_csv: if given, path to save CSV
-
-    Returns:
-      DataFrame with SMILES and predictions
-    """
-    df = pd.DataFrame({ 'SMILES': smiles_list })
-    result = predict_df(
-        df, 'SMILES', checkpoint_paths,
-        mode=mode, aggregated=aggregated,
-        batch_size=batch_size, device=device
+    df = pd.DataFrame({'SMILES': smiles_list})
+    res = predict_df(
+        df, 'SMILES',
+        checkpoints      = checkpoints,
+        mode             = mode,
+        aggregated       = aggregated,
+        batch_size       = batch_size,
+        device           = device
     )
     if output_csv:
-        result.to_csv(output_csv, index=False)
-    return result
+        res.to_csv(output_csv, index=False)
+    return res
