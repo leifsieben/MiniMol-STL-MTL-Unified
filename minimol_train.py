@@ -130,6 +130,7 @@ def train_model(
         filename=filename,
         monitor=monitor_name,
         save_top_k=1,
+        every_n_epochs=5, # checkpoint less frequently
         mode=mode_minmax
     )
     callbacks.append(ckpt_cb)
@@ -143,14 +144,13 @@ def train_model(
             )
         )
 
-
-
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         callbacks=callbacks,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
         enable_progress_bar=False,
+        default_root_dir=ckpt_dir
     )
 
     train_loader = dm.train_dataloader()
