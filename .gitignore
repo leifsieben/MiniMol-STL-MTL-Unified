@@ -1,0 +1,12 @@
+/tests
+
+# Python artifacts
+__pycache__/
+*.pyc
+.DS_Store
+
+# model checkpoints & targets
+*.ckpt
+*.pt
+checkpoints/
+ray_results/
