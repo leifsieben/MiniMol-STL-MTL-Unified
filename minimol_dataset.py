@@ -50,6 +50,7 @@ def precompute_features(
     standardize_smiles: bool = True,
     batch_size: int = 10000,
     sep: str = ",",
+    skip_if_exists: bool = True
 ):
     """
     Reads a CSV file or DataFrame, standardizes SMILES, filters invalid/missing,
@@ -59,6 +60,10 @@ def precompute_features(
       - metadata.csv   (raw SMILES) if save_smiles
       - meta.json      (smiles_col, target_cols)
     """
+    out_feat = os.path.join(output_dir, "features.pt")
+    if skip_if_exists and os.path.exists(out_feat):
+        print(f"[precompute] skipping, found existing {out_feat}")
+        return
     # Load DataFrame
     if isinstance(input_data, str):
         df = pd.read_csv(input_data, sep=sep)
