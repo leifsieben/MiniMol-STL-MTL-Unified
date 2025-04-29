@@ -10,3 +10,5 @@ __pycache__/
 *.pt
 checkpoints/
 ray_results/
+
+.pytest_cache
