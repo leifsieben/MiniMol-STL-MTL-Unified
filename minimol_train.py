@@ -160,15 +160,20 @@ def train_model(
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
     )
+
     if report_to_ray:
+        # fetch the Lightning-checkpoint’s best score (a torch scalar or None)
         best_val = ckpt_cb.best_model_score
+
+        # always produce a plain Python float for reporting
         if best_val is not None:
-            ray_metric = best_val.item()
+            metric_val = best_val.item()
         else:
-            ray_metric = float('inf') if mode_minmax == 'min' else -float('inf')
-    
-    # Always report a consistent key to Ray Tune
-    tune.report({"ray_metric": ray_metric})
+            # use +inf for minimization or -inf for maximization
+            metric_val = float('inf') if mode_minmax == 'min' else -float('inf')
+
+        # now report exactly once, with an explicit dict
+        tune.report({"ray_metric": metric_val})
 
 
     test_loader = dm.test_dataloader()
