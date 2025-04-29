@@ -237,13 +237,7 @@ def run_hyperopt(
         scheduler=scheduler,
         resources_per_trial={'cpu': cpus_per_trial, 'gpu': gpus_per_trial},
         storage_path=storage_uri,        # <-- updated
-        name="hyperopt",
-        metric=(
-            'val_loss'
-            if monitor_metric == 'loss'
-            else f"val_{monitor_metric}_task_{monitor_task}"
-        ),
-        mode=('min' if monitor_metric == 'loss' else 'max')
+        name="hyperopt"
     )
 
     best = analysis.get_best_config(
