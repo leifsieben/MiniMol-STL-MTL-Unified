@@ -285,7 +285,7 @@ splits = {
   "test":  df.iloc[3:]
 }
 for name, split in splits.items():
-    precompute_features(split, name, smiles_col="SMILES", target_cols=["Hit"], clean_data=True)
+    precompute_features(split, name, smiles_col="SMILES", target_cols=["Hit"], standardize_smiles=True)
 
 # Hyperopt
 best_cfg = run_hyperopt("train","val","test", mode="stl", max_epochs=5, hyperopt_num_samples=20)
