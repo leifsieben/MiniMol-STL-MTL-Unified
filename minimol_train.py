@@ -41,13 +41,17 @@ def compute_val_metrics(model, dataloader, metric_type: str):
 
 
 class MultiTaskMetricCallback(pl.Callback):
-    def __init__(self, metric_type: str, monitor_tasks: list):
-        self.metric_type = metric_type
+    def __init__(self, metric_type: str, monitor_tasks: list, val_dataloader):
+        """
+        val_dataloader: the DataLoader to use for per-task metric computation
+        """
+        self.metric_type   = metric_type
         self.monitor_tasks = monitor_tasks
+        self.val_dataloader = val_dataloader
 
     def on_validation_epoch_end(self, trainer, pl_module):
         # compute per-task AUROC or AUPRC
-        metrics = compute_val_metrics(pl_module, trainer.datamodule.val_dataloader(), self.metric_type)
+        metrics = compute_val_metrics(pl_module, self.val_dataloader, self.metric_type)
         for t in self.monitor_tasks:
             name = f"val_{self.metric_type}_task_{t}"
             # log to Lightning
@@ -103,9 +107,16 @@ def train_model(
         model = model.load_from_checkpoint(checkpoint_path, strict=False)
 
     callbacks = []
-    # metric callbacks
-    if monitor_metric in ['auroc', 'auprc']:
-        callbacks.append(MultiTaskMetricCallback(monitor_metric, [monitor_task]))
+    # metric callbacks (only for MTL, pass in the val loader)
+    if mode == 'mtl' and monitor_metric in ['auroc', 'auprc']:
+        val_loader = dm.val_dataloader()
+        callbacks.append(
+            MultiTaskMetricCallback(
+                metric_type   = monitor_metric,
+                monitor_tasks = [monitor_task],
+                val_dataloader= val_loader
+            )
+        )
 
     # define monitor name and mode
     monitor_name = (
@@ -130,7 +141,7 @@ def train_model(
         filename=filename,
         monitor=monitor_name,
         save_top_k=1,
-        every_n_epochs=5, # checkpoint less frequently
+        save_last=True, 
         mode=mode_minmax
     )
     callbacks.append(ckpt_cb)
@@ -160,6 +171,7 @@ def train_model(
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
     )
+    
 
     if report_to_ray:
         # fetch the Lightning-checkpoint’s best score (a torch scalar or None)
@@ -178,6 +190,8 @@ def train_model(
 
     test_loader = dm.test_dataloader()
     trainer.test(model, dataloaders=test_loader)
+    return ckpt_cb.best_model_path
+
 
 def run_hyperopt(
     train_dir: str,

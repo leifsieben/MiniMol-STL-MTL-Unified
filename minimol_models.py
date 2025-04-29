@@ -102,7 +102,7 @@ class MTL_FFN(pl.LightningModule):
         activation_function: str='relu', dropout_rate: float=0.0,
         use_batch_norm: bool=False, use_residual: bool=False,
         scheduler_step_size: int=5, scheduler_gamma: float=0.5,
-        loss_type: str='bce_with_logits'
+        loss_type: str='bce_with_logits', 
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -119,21 +119,26 @@ class MTL_FFN(pl.LightningModule):
     def forward(self, x): return self.head(_forward_shared(x, self.layers, self.hparams.use_residual))
 
     def _compute_loss(self, preds, y):
-        total, cnt = 0, 0
+        # unweighted average over all valid tasks
+        losses = []
         for t in range(self.hparams.output_dim):
-            mask = y[:,t]>=0
+            mask = y[:,t] >= 0
             if mask.any():
-                logits = preds[mask,t]
-                tgt = y[mask,t].float()
-                total += F.binary_cross_entropy_with_logits(logits,tgt)
-                cnt += 1
-        loss = total/cnt if cnt>0 else torch.tensor(0.0,device=preds.device)
+                logits = preds[mask, t]
+                tgt    = y[mask, t].float()
+                losses.append(F.binary_cross_entropy_with_logits(logits, tgt))
+        if not losses:
+            return torch.tensor(0.0, device=preds.device, requires_grad=True)
+        loss = torch.stack(losses).mean()
         if self.hparams.L1_weight_norm>0:
             loss += self.hparams.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
         return loss
 
     def training_step(self, b, i): x,y=b['x'],b['y']; batch_size=x.size(0); loss=self._compute_loss(self(x),y); self.log('train_loss',loss, batch_size=batch_size); return loss
-    def validation_step(self, b, i): x,y=b['x'],b['y']; batch_size=x.size(0); loss=self._compute_loss(self(x),y); self.log('val_loss',loss, batch_size=batch_size, prog_bar=True)
+    def validation_step(self, batch, batch_idx):
+        x, y = batch['x'], batch['y']
+        loss = self._compute_loss(self(x), y)
+        self.log('val_loss', loss, batch_size=x.size(0), on_epoch=True, prog_bar=True)
     def test_step(self, b, i): x,y=b['x'],b['y']; batch_size=x.size(0); loss=self._compute_loss(self(x),y); self.log('test_loss',loss, batch_size=batch_size)
 
     def configure_optimizers(self):
