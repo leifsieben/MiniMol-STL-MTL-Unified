@@ -72,9 +72,11 @@ class STL_FFN(pl.LightningModule):
         if self.hparams.L1_weight_norm>0:
             loss += self.hparams.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
         # for both train and val, log per‐epoch; show prog_bar only on val
+        batch_size = x.size(0)
         self.log(
             f"{stage}_loss",
             loss,
+            batch_size=batch_size,
             on_epoch=True,
             prog_bar=(stage == "val"),
             on_step=False
@@ -130,9 +132,9 @@ class MTL_FFN(pl.LightningModule):
             loss += self.hparams.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
         return loss
 
-    def training_step(self, b, i): x,y=b['x'],b['y']; loss=self._compute_loss(self(x),y); self.log('train_loss',loss); return loss
-    def validation_step(self, b, i): x,y=b['x'],b['y']; loss=self._compute_loss(self(x),y); self.log('val_loss',loss,prog_bar=True)
-    def test_step(self, b, i): x,y=b['x'],b['y']; loss=self._compute_loss(self(x),y); self.log('test_loss',loss)
+    def training_step(self, b, i): x,y=b['x'],b['y']; batch_size=x.size(0); loss=self._compute_loss(self(x),y); self.log('train_loss',loss, batch_size=batch_size); return loss
+    def validation_step(self, b, i): x,y=b['x'],b['y']; batch_size=x.size(0); loss=self._compute_loss(self(x),y); self.log('val_loss',loss, batch_size=batch_size, prog_bar=True)
+    def test_step(self, b, i): x,y=b['x'],b['y']; batch_size=x.size(0); loss=self._compute_loss(self(x),y); self.log('test_loss',loss, batch_size=batch_size)
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate, weight_decay=self.hparams.L2_weight_norm)
