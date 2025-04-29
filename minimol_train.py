@@ -161,10 +161,15 @@ def train_model(
         val_dataloaders=val_loader,
     )
     if report_to_ray:
-        # best_model_score is a torch scalar
         best_val = ckpt_cb.best_model_score
-        # convert to Python float
-        ray.tune.report(**{monitor_name: best_val.item()})
+        if best_val is not None:
+            ray_metric = best_val.item()
+        else:
+            ray_metric = float('inf') if mode_minmax == 'min' else -float('inf')
+    
+    # Always report a consistent key to Ray Tune
+    tune.report({"ray_metric": ray_metric})
+
 
     test_loader = dm.test_dataloader()
     trainer.test(model, dataloaders=test_loader)
@@ -204,8 +209,7 @@ def run_hyperopt(
         'loss_type': tune.choice(['bce_with_logits']),
     }
     scheduler = ASHAScheduler(
-        metric=('val_loss' if monitor_metric == 'loss'
-                else f"val_{monitor_metric}_task_{monitor_task}"),
+        metric='ray_metric',
         mode=('min' if monitor_metric == 'loss' else 'max'),
         max_t=max_epochs,
         grace_period=1,
@@ -236,22 +240,16 @@ def run_hyperopt(
         num_samples=hyperopt_num_samples,
         scheduler=scheduler,
         resources_per_trial={'cpu': cpus_per_trial, 'gpu': gpus_per_trial},
-        storage_path=storage_uri,        # <-- updated
+        storage_path=storage_uri,        
         name="hyperopt"
     )
 
     best = analysis.get_best_config(
-        metric=(
-            'val_loss'
-            if monitor_metric == 'loss'
-            else f"val_{monitor_metric}_task_{monitor_task}"
-        ),
+        metric='ray_metric',
         mode=('min' if monitor_metric == 'loss' else 'max')
     )
     print("Best hyperparameters:", best)
     return best
-
-
 
 
 
