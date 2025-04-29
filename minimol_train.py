@@ -6,6 +6,7 @@ from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 import ray
 from sklearn.metrics import roc_auc_score, average_precision_score
+from pathlib import Path
 
 from minimol_dataset import PrecomputedDataModule, precompute_features
 from minimol_models import STL_FFN, MTL_FFN
@@ -210,6 +211,11 @@ def run_hyperopt(
         grace_period=1,
         reduction_factor=2
     )
+
+    # Convert your tune_dir to an absolute `file://` URI
+    abs_path = Path(tune_dir).absolute()
+    storage_uri = f"file://{abs_path}"
+
     analysis = tune.run(
         tune.with_parameters(
             train_model,
@@ -230,19 +236,29 @@ def run_hyperopt(
         num_samples=hyperopt_num_samples,
         scheduler=scheduler,
         resources_per_trial={'cpu': cpus_per_trial, 'gpu': gpus_per_trial},
-        storage_path=tune_dir,
+        storage_path=storage_uri,        # <-- updated
         name="hyperopt",
-        metric=('val_loss' if monitor_metric == 'loss'
-                else f"val_{monitor_metric}_task_{monitor_task}"),
+        metric=(
+            'val_loss'
+            if monitor_metric == 'loss'
+            else f"val_{monitor_metric}_task_{monitor_task}"
+        ),
         mode=('min' if monitor_metric == 'loss' else 'max')
     )
+
     best = analysis.get_best_config(
-        metric=('val_loss' if monitor_metric == 'loss'
-                else f"val_{monitor_metric}_task_{monitor_task}"),
+        metric=(
+            'val_loss'
+            if monitor_metric == 'loss'
+            else f"val_{monitor_metric}_task_{monitor_task}"
+        ),
         mode=('min' if monitor_metric == 'loss' else 'max')
     )
     print("Best hyperparameters:", best)
     return best
+
+
+
 
 
 if __name__ == '__main__':
