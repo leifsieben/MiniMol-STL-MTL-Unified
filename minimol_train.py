@@ -230,7 +230,8 @@ def run_hyperopt(
         num_samples=hyperopt_num_samples,
         scheduler=scheduler,
         resources_per_trial={'cpu': cpus_per_trial, 'gpu': gpus_per_trial},
-        local_dir=tune_dir,
+        storage_path=tune_dir,
+        name="hyperopt",
         metric=('val_loss' if monitor_metric == 'loss'
                 else f"val_{monitor_metric}_task_{monitor_task}"),
         mode=('min' if monitor_metric == 'loss' else 'max')
