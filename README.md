@@ -15,7 +15,7 @@ pip install torch pytorch-lightning scikit-learn rdkit-pypi minimol ray[tune]
 Alternatively, clone this repository and install with:
 
 ```bash
-git clone https://github.com/yourusername/minimol-toolkit.git](https://github.com/leifsieben/MiniMol-STL-MTL-Unified
+git clone https://github.com/leifsieben/MiniMol-STL-MTL-Unified
 cd MiniMol-STL-MTL-Unified
 pip install -r requirements.txt
 ```
