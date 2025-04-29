@@ -48,7 +48,7 @@ def load_model(
             # last bias vector’s length = number of tasks
             output_dim = bias_cands[-1].shape[0]
             model = ModelCls(input_dim=input_dim, output_dim=output_dim)
-        if mode == 'stl':
+        elif mode == 'stl':
             model = ModelCls(input_dim=input_dim)
         else:
             raise ValueError(f"Invalid mode: {mode}")
