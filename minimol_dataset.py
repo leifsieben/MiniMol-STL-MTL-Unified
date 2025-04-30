@@ -41,92 +41,150 @@ def standardize(smiles: str) -> str:
     except Exception:
         return None
 
+import os, json
+import pandas as pd
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+from rdkit import Chem
+from minimol import Minimol
+from hydra.core.global_hydra import GlobalHydra
+
 def precompute_features(
     input_data,
     output_dir: str,
     smiles_col: str = "SMILES",
     target_cols: list = None,
-    save_smiles: bool = True,
+    metadata_keys: list = None,
     standardize_smiles: bool = True,
-    batch_size: int = 10000,
-    sep: str = ",",
+    batch_size: int = 1_000,
     skip_if_exists: bool = True
 ):
     """
-    Reads a CSV file or DataFrame, standardizes SMILES, filters invalid/missing,
-    featurizes with Minimol, and saves under output_dir:
-      - features.pt    (FloatTensor [N, D])
-      - targets.pt     (FloatTensor [N, T]) if targets
-      - metadata.csv   (raw SMILES) if save_smiles
-      - meta.json      (smiles_col, target_cols)
+    1) Load CSV/Parquet or DataFrame from `input_data`
+    2) Standardize SMILES (if requested), drop invalid / NaN targets
+    3) Featurize via MiniMol → FloatTensor [N, D] in large batches,
+       skipping only the individual SMILES that truly fail
+    4) Save under `output_dir`:
+       - features.pt      (Tensor [N, D])
+       - targets.pt       (Tensor [N, T]) if target_cols
+       - metadata.csv     (subset of original columns for kept rows)
+       - meta.json        (smiles_col, target_cols, metadata_keys)
     """
-    out_feat = os.path.join(output_dir, "features.pt")
-    if skip_if_exists and os.path.exists(out_feat):
-        print(f"[precompute] skipping, found existing {out_feat}")
-        return
-    # Load DataFrame
-    if isinstance(input_data, str):
-        df = pd.read_csv(input_data, sep=sep)
+    os.makedirs(output_dir, exist_ok=True)
+    feat_path = os.path.join(output_dir, "features.pt")
+    if skip_if_exists and os.path.exists(feat_path):
+        print(f"[precompute] skipping, found {feat_path}")
+        return feat_path, os.path.join(output_dir, "metadata.csv")
+
+    # ——— Load DataFrame ———
+    if isinstance(input_data, (str, os.PathLike)):
+        if str(input_data).endswith(".csv"):
+            df = pd.read_csv(input_data)
+        else:
+            df = pd.read_parquet(input_data)
     else:
         df = input_data.copy()
 
-    # Check columns
+    # ——— Column checks ———
     if smiles_col not in df.columns:
-        raise ValueError(f"SMILES column '{smiles_col}' not found.")
+        raise KeyError(f"SMILES column '{smiles_col}' not found")
     if target_cols:
-        missing = [c for c in target_cols if c not in df.columns]
+        missing = set(target_cols) - set(df.columns)
         if missing:
-            raise ValueError(f"Target columns {missing} not in DataFrame.")
+            raise KeyError(f"Target columns {missing} not in DataFrame")
 
-    raw_smiles, targets_list = [], []
+    # default: save *all* columns
+    if metadata_keys is None:
+        metadata_keys = list(df.columns)
 
-    # Standardize and filter
-    for _, row in tqdm(df.iterrows(), total=len(df)):
+    # ——— Standardize & initial filter ———
+    raw_smiles = []
+    initial_targets = []
+    initial_indices = []
+    for label, row in df.iterrows():
         smi = row[smiles_col]
-        std = standardize(smi) if standardize_smiles else smi
+        std = smi
+        if standardize_smiles:
+            mol = Chem.MolFromSmiles(smi)
+            std = Chem.MolToSmiles(mol) if mol else None
         if std is None:
             continue
+
         if target_cols:
             t = row[target_cols].to_numpy(dtype=np.float32, na_value=np.nan)
             if np.isnan(t).any():
                 continue
-            targets_list.append(t)
-        raw_smiles.append(std)
+            initial_targets.append(t)
 
-    # if Hydra was already initialized by a previous run, clear it
+        raw_smiles.append(std)
+        initial_indices.append(label)
+
+    # clear Hydra if needed
     gh = GlobalHydra.instance()
     if gh.is_initialized():
         gh.clear()
 
-    # Featurize
-    featurizer = Minimol(batch_size=int(batch_size))
-    try:
-        feats = featurizer(raw_smiles)
-    except Exception as e:
-        raise RuntimeError(f"Featurization error: {e}")
+    # ——— Batched featurization with divide‐and‐conquer skip ———
+    def _featurize_with_skips(featurizer, smiles_list, positions):
+        try:
+            feats = featurizer(smiles_list)
+            return feats, smiles_list, positions
+        except Exception:
+            if len(smiles_list) == 1:
+                print(f"[precompute] dropping '{smiles_list[0]}'")
+                return [], [], []
+            mid = len(smiles_list) // 2
+            lf, ls, lp = _featurize_with_skips(
+                featurizer, smiles_list[:mid], positions[:mid]
+            )
+            rf, rs, rp = _featurize_with_skips(
+                featurizer, smiles_list[mid:], positions[mid:]
+            )
+            return lf + rf, ls + rs, lp + rp
 
-    features_tensor = torch.stack([f.clone().detach().float() for f in feats])
+    featurizer = Minimol(batch_size=batch_size)
+    feats, kept_smiles, kept_positions = _featurize_with_skips(
+        featurizer, raw_smiles, initial_indices
+    )
+    if not feats:
+        raise RuntimeError("No SMILES could be featurized.")
+
+    features_tensor = torch.stack([f.float().detach() for f in feats])
+
+    # ——— Align & stack targets ———
     targets_tensor = None
-    if target_cols and len(targets_list) > 0:
-        arr = np.stack(targets_list, axis=0)
-        targets_tensor = torch.tensor(arr, dtype=torch.float32)
+    if target_cols and initial_targets:
+        # map original df‐indices to their target arrays
+        target_map = {idx: t for idx, t in zip(initial_indices, initial_targets)}
+        final_targets = [target_map[pos] for pos in kept_positions]
+        targets_tensor = torch.tensor(np.stack(final_targets), dtype=torch.float32)
 
-    # Write to disk
-    os.makedirs(output_dir, exist_ok=True)
-    torch.save(features_tensor, os.path.join(output_dir, "features.pt"))
+    # ——— Write out ———
+    torch.save(features_tensor, feat_path)
     if targets_tensor is not None:
         torch.save(targets_tensor, os.path.join(output_dir, "targets.pt"))
-    if save_smiles:
-        pd.DataFrame({smiles_col: raw_smiles}).to_csv(
-            os.path.join(output_dir, "metadata.csv"), index=False
-        )
-    # Save config
-    meta = {"smiles_col": smiles_col, "target_cols": target_cols}
-    import json
-    with open(os.path.join(output_dir, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
 
-    print(f"Saved features.pt{', targets.pt' if targets_tensor is not None else ''}{', metadata.csv' if save_smiles else ''}, meta.json in {output_dir}")
+    # subset metadata to only successfully featurized rows and save CSV
+    meta_df = df.loc[kept_positions, metadata_keys]
+    meta_csv = os.path.join(output_dir, "metadata.csv")
+    meta_df.to_csv(meta_csv, index=False)
+
+    # write the small JSON with config
+    with open(os.path.join(output_dir, "meta.json"), "w") as f:
+        json.dump({
+            "smiles_col": smiles_col,
+            "target_cols": target_cols,
+            "metadata_keys": metadata_keys
+        }, f, indent=2)
+
+    print(
+        f"[precompute] wrote features.pt, "
+        f"{'targets.pt, ' if targets_tensor is not None else ''}"
+        f"metadata.csv, meta.json → {output_dir}"
+    )
+    return feat_path, meta_csv
+
 
 class PrecomputedDataset(Dataset):
     """
