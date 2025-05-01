@@ -35,6 +35,7 @@ class STL_FFN(pl.LightningModule):
         activation_function: str='relu', dropout_rate: float=0.0,
         use_batch_norm: bool=False, use_residual: bool=False,
         scheduler_step_size: int=5, scheduler_gamma: float=0.5,
+        loss_type: str = 'bce_with_logits',
     ):
         super().__init__()
         self.save_hyperparameters()

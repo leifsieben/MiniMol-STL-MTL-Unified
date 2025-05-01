@@ -1,13 +1,15 @@
 import os
 import torch
-import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from ray import tune
-from ray.tune.schedulers import ASHAScheduler
-import ray
+import optuna
 from sklearn.metrics import roc_auc_score, average_precision_score
-from pathlib import Path
+from optuna.integration.pytorch_lightning import PyTorchLightningPruningCallback as _OptunaPruningCallback
+import pytorch_lightning as pl
 
+# wrap so Lightning truly sees it as a pl.Callback subclass
+class PyTorchLightningPruningCallback(_OptunaPruningCallback, pl.Callback):
+    def __init__(self, trial, monitor):
+        super().__init__(trial, monitor)
 from minimol_dataset import PrecomputedDataModule, precompute_features
 from minimol_models import STL_FFN, MTL_FFN
 
@@ -85,6 +87,15 @@ def train_model(
     # seed differently for each ensemble member
     if ensemble_size > 1:
         pl.seed_everything(seed + ensemble_idx)
+    if ensemble_size < 1:
+        print("Warning: ensemble_size can't be smaller than 1, setting to 1")
+        ensemble_size =1
+    if num_workers < 1:
+        print("Warning: num_workers can't be smaller than 1, setting to 1")
+        num_workers = 1
+    if early_stop_patience < 1:
+        print("Warning: early_stop_patience can't be smaller than 1, setting to 1")
+        early_stop_patience = 1
 
     dm = PrecomputedDataModule(
         train_dir, val_dir, test_dir,
@@ -171,224 +182,231 @@ def train_model(
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
     )
-    
-
-    if report_to_ray:
-        # fetch the Lightning-checkpoint’s best score (a torch scalar or None)
-        best_val = ckpt_cb.best_model_score
-
-        # always produce a plain Python float for reporting
-        if best_val is not None:
-            metric_val = best_val.item()
-        else:
-            # use +inf for minimization or -inf for maximization
-            metric_val = float('inf') if mode_minmax == 'min' else -float('inf')
-
-        # now report exactly once, with an explicit dict
-        tune.report({"ray_metric": metric_val})
-
 
     test_loader = dm.test_dataloader()
     trainer.test(model, dataloaders=test_loader)
     return ckpt_cb.best_model_path
 
-
 def run_hyperopt(
-    train_dir: str,
-    val_dir: str,
-    test_dir: str,
-    mode: str = 'mtl',
-    max_epochs: int = 10,
-    num_workers: int = 4,
-    checkpoint_path: str = None,
-    early_stop: bool = True,
-    early_stop_patience: int = 3,
-    monitor_metric: str = 'loss',
-    monitor_task: int = 0,
-    hyperopt_num_samples: int = 20,
-    cpus_per_trial: int = 1,
-    gpus_per_trial: int = 0,
-    tune_dir: str = './ray_results',
+    train_dir, val_dir, test_dir,
+    mode, max_epochs, num_workers,
+    monitor_metric, monitor_task,
+    early_stop_patience,
+    n_trials, n_jobs,
+    storage_url, study_name="minimol_study"
 ):
-    # same as before; ensemble not applied here
-    search_space = {
-        'dim_size': tune.lograndint(128, 4096),
-        'shrinking_scale': tune.uniform(0.5, 1.0),
-        'num_layers': tune.randint(1, 15),
-        'learning_rate': tune.loguniform(1e-6, 1e-1),
-        'batch_size': tune.choice([32, 64, 128, 256]),
-        'dropout_rate': tune.uniform(0.0, 0.9),
-        'activation_function': tune.choice(['relu', 'tanh', 'leaky_relu', 'gelu']),
-        'use_batch_norm': tune.choice([True, False]),
-        'use_residual': tune.choice([True, False]),
-        'L1_weight_norm': tune.loguniform(1e-12, 1e-2),
-        'L2_weight_norm': tune.loguniform(1e-8, 1e-2),
-        'scheduler_step_size': tune.randint(1, 20),
-        'scheduler_gamma': tune.uniform(0.1, 0.9),
-        'loss_type': tune.choice(['bce_with_logits']),
-    }
-    scheduler = ASHAScheduler(
-        metric='ray_metric',
-        mode=('min' if monitor_metric == 'loss' else 'max'),
-        max_t=max_epochs,
-        grace_period=1,
-        reduction_factor=2
+    direction = "minimize" if monitor_metric=="loss" else "maximize"
+    study = optuna.create_study(
+        study_name=study_name,
+        direction=direction,
+        storage=storage_url,
+        load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner()
     )
+    if num_workers < 1:
+        print("Warning: num_workers can't be smaller than 1, setting to 1")
+        num_workers = 1
+    if early_stop_patience < 1:
+        print("Warning: early_stop_patience can't be smaller than 1, setting to 1")
+        early_stop_patience = 1
 
-    # Convert your tune_dir to an absolute `file://` URI
-    abs_path = Path(tune_dir).absolute()
-    storage_uri = f"file://{abs_path}"
+    def _objective(trial):
+        # 1) sample exactly as before
+        cfg = {
+            "dim_size":         trial.suggest_int("dim_size", 128, 4096, log=True),
+            "shrinking_scale":  trial.suggest_float("shrinking_scale", 0.5, 1.0),
+            "num_layers":       trial.suggest_int("num_layers", 1, 15),
+            "learning_rate":    trial.suggest_float("learning_rate", 1e-6, 1e-1, log=True),
+            "batch_size":       trial.suggest_categorical("batch_size", [32,64,128,256]),
+            "dropout_rate":     trial.suggest_float("dropout_rate", 0.0, 0.9),
+            "activation_function": trial.suggest_categorical(
+                                        "activation_function",
+                                        ['relu','tanh','leaky_relu','gelu']
+                                    ),
+            "use_batch_norm":   trial.suggest_categorical("use_batch_norm",[True,False]),
+            "use_residual":     trial.suggest_categorical("use_residual",[True,False]),
+            "L1_weight_norm":   trial.suggest_float("L1_weight_norm",1e-12,1e-2, log=True),
+            "L2_weight_norm":   trial.suggest_float("L2_weight_norm",1e-8,1e-2, log=True),
+            "scheduler_step_size": trial.suggest_int("scheduler_step_size",1,20),
+            "scheduler_gamma":  trial.suggest_float("scheduler_gamma",0.1,0.9),
+            "loss_type":        "bce_with_logits",
+        }
 
-    analysis = tune.run(
-        tune.with_parameters(
-            train_model,
-            train_dir=train_dir,
-            val_dir=val_dir,
-            test_dir=test_dir,
-            mode=mode,
+        # 2) data
+        dm = PrecomputedDataModule(
+            train_dir, val_dir, test_dir,
+            batch_size=cfg["batch_size"],
+            num_workers=num_workers
+        )
+        dm.setup()
+        feats  = torch.load(os.path.join(train_dir, "features.pt"))
+        targs  = torch.load(os.path.join(train_dir, "targets.pt"))
+        in_dim = feats.shape[1]
+        out_dim= (targs.shape[1] if mode=="mtl" else 1)
+
+        # 3) model
+        ModelCls = MTL_FFN if mode=="mtl" else STL_FFN
+        if mode=="mtl":  cfg["output_dim"] = out_dim
+        model = ModelCls(input_dim=in_dim, **cfg)
+
+        # 4) callbacks
+        MON = f"val_{monitor_metric}" + (f"_task_{monitor_task}" if monitor_metric!="loss" else "")
+        ckpt = ModelCheckpoint(monitor=MON, mode=("min" if monitor_metric=="loss" else "max"))
+        es   = EarlyStopping(monitor=MON, patience=early_stop_patience,
+                             mode=("min" if monitor_metric=="loss" else "max"))
+        pruner = PyTorchLightningPruningCallback(trial, monitor=MON)
+
+        trainer = pl.Trainer(
             max_epochs=max_epochs,
-            num_workers=num_workers,
-            checkpoint_path=checkpoint_path,
-            early_stop=early_stop,
-            early_stop_patience=early_stop_patience,
-            monitor_metric=monitor_metric,
-            monitor_task=monitor_task,
-            report_to_ray=True
-        ),
-        config=search_space,
-        num_samples=hyperopt_num_samples,
-        scheduler=scheduler,
-        resources_per_trial={'cpu': cpus_per_trial, 'gpu': gpus_per_trial},
-        storage_path=storage_uri,        
-        name="hyperopt"
-    )
+            callbacks=[ckpt, es, pruner],
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices=1,
+            enable_progress_bar=False,
+        )
+        trainer.fit(model, dm.train_dataloader(), dm.val_dataloader())
+        return ckpt.best_model_score.item()
 
-    best = analysis.get_best_config(
-        metric='ray_metric',
-        mode=('min' if monitor_metric == 'loss' else 'max')
-    )
-    print("Best hyperparameters:", best)
-    return best
+    study.optimize(_objective, n_trials=n_trials, n_jobs=n_jobs)
+    print("Best params:", study.best_trial.params)
+    return study.best_trial.params
 
-
-
-if __name__ == '__main__':
+def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['stl', 'mtl'], required=True)
-    parser.add_argument('--train_dir', required=True)
-    parser.add_argument('--val_dir', required=True)
-    parser.add_argument('--test_dir', required=True)
-    parser.add_argument('--precompute', action='store_true')
+    parser = argparse.ArgumentParser(
+        description="Precompute, train, or hyperopt a MiniMol‐FFN model"
+    )
+    # core directories & mode
+    parser.add_argument('--mode',        choices=['stl','mtl'], required=True)
+    parser.add_argument('--train_dir',   required=True)
+    parser.add_argument('--val_dir',     required=True)
+    parser.add_argument('--test_dir',    required=True)
+
+    # precompute
+    parser.add_argument('--precompute',      action='store_true')
     parser.add_argument('--input_tsv')
-    parser.add_argument('--fingerprint_col')
-    parser.add_argument('--target_cols', nargs='+')
-    parser.add_argument('--metadata_cols', nargs='+')
+    parser.add_argument('--target_cols',     nargs='+')
+    parser.add_argument('--metadata_cols',   nargs='+')
     parser.add_argument('--output_dir')
+
+    # checkpoint (for resume in non‐hyperopt/train)
     parser.add_argument('--checkpoint_path')
-    parser.add_argument('--max_epochs', type=int, default=10)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--hyperopt', action='store_true')
-    parser.add_argument('--hyperopt_num_samples', type=int, default=20)
-    parser.add_argument('--cpus_per_trial', type=int, default=1)
-    parser.add_argument('--gpus_per_trial', type=int, default=0)
-    parser.add_argument('--tune_dir', type=str, default='./ray_results')
-    parser.add_argument('--early_stop', action='store_true')
+
+    # training settings
+    parser.add_argument('--max_epochs',       type=int, default=10)
+    parser.add_argument('--num_workers',      type=int, default=4)
+    parser.add_argument('--early_stop',       action='store_true')
     parser.add_argument('--early_stop_patience', type=int, default=3)
-    parser.add_argument('--monitor_metric', choices=['loss', 'auroc', 'auprc'], default='loss')
-    parser.add_argument('--monitor_task', type=int, default=0)
-    parser.add_argument('--ensemble', type=int, default=1)
-    # hyperparameters for non-hyperopt runs
-    parser.add_argument('--dim_size', type=int, default=128)
-    parser.add_argument('--shrinking_scale', type=float, default=0.5)
-    parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--dropout_rate', type=float, default=0.0)
+    parser.add_argument('--monitor_metric',   choices=['loss','auroc','auprc'],
+                        default='loss')
+    parser.add_argument('--monitor_task',     type=int, default=0)
+    parser.add_argument('--ensemble',         type=int, default=1)
+
+    # hyperopt (Optuna)
+    parser.add_argument('--hyperopt',         action='store_true',
+                        help="run Optuna hyperparameter search")
+    parser.add_argument('--n_trials',         type=int, default=20,
+                        help="number of Optuna trials")
+    parser.add_argument('--n_jobs',           type=int, default=1,
+                        help="parallel jobs for Optuna.study.optimize")
+    parser.add_argument('--optuna_storage',   type=str,
+                        default='sqlite:///optuna.db',
+                        help="Optuna storage URL (e.g. sqlite or postgresql)")
+
+    # manual hyperparams (for non‐hyperopt train)
+    parser.add_argument('--dim_size',          type=int,   default=128)
+    parser.add_argument('--shrinking_scale',   type=float, default=0.5)
+    parser.add_argument('--num_layers',        type=int,   default=3)
+    parser.add_argument('--learning_rate',     type=float, default=1e-3)
+    parser.add_argument('--batch_size',        type=int,   default=32)
+    parser.add_argument('--dropout_rate',      type=float, default=0.0)
     parser.add_argument('--activation_function', type=str, default='relu')
-    parser.add_argument('--use_batch_norm', action='store_true')
-    parser.add_argument('--use_residual', action='store_true')
-    parser.add_argument('--L1_weight_norm', type=float, default=0.0)
-    parser.add_argument('--L2_weight_norm', type=float, default=0.0)
+    parser.add_argument('--use_batch_norm',    action='store_true')
+    parser.add_argument('--use_residual',      action='store_true')
+    parser.add_argument('--L1_weight_norm',    type=float, default=0.0)
+    parser.add_argument('--L2_weight_norm',    type=float, default=0.0)
     parser.add_argument('--scheduler_step_size', type=int, default=5)
-    parser.add_argument('--scheduler_gamma', type=float, default=0.5)
-    parser.add_argument('--loss_type', type=str, default='bce_with_logits')
+    parser.add_argument('--scheduler_gamma',   type=float, default=0.5)
+    parser.add_argument('--loss_type',         type=str, default='bce_with_logits')
+
     args = parser.parse_args()
 
     if args.precompute:
         precompute_features(
             args.input_tsv,
-            args.fingerprint_col,
             args.target_cols,
             args.output_dir,
             metadata_cols=args.metadata_cols
         )
+
+    elif args.hyperopt:
+        best_params = run_hyperopt(
+            train_dir           = args.train_dir,
+            val_dir             = args.val_dir,
+            test_dir            = args.test_dir,
+            mode                = args.mode,
+            max_epochs          = args.max_epochs,
+            num_workers         = args.num_workers,
+            monitor_metric      = args.monitor_metric,
+            monitor_task        = args.monitor_task,
+            early_stop_patience = args.early_stop_patience,
+            n_trials            = args.n_trials,
+            n_jobs              = args.n_jobs,
+            storage_url         = args.optuna_storage,
+        )
+        print("Optuna best hyperparameters:", best_params)
+
     else:
-        if args.hyperopt:
-            run_hyperopt(
-                train_dir=args.train_dir,
-                val_dir=args.val_dir,
-                test_dir=args.test_dir,
-                mode=args.mode,
-                max_epochs=args.max_epochs,
-                num_workers=args.num_workers,
-                checkpoint_path=args.checkpoint_path,
-                early_stop=args.early_stop,
-                early_stop_patience=args.early_stop_patience,
-                monitor_metric=args.monitor_metric,
-                monitor_task=args.monitor_task,
-                hyperopt_num_samples=args.hyperopt_num_samples,
-                cpus_per_trial=args.cpus_per_trial,
-                gpus_per_trial=args.gpus_per_trial,
-                tune_dir=args.tune_dir
-            )
-        else:
-            cfg = {
-                'dim_size': args.dim_size,
-                'shrinking_scale': args.shrinking_scale,
-                'num_layers': args.num_layers,
-                'learning_rate': args.learning_rate,
-                'batch_size': args.batch_size,
-                'dropout_rate': args.dropout_rate,
-                'activation_function': args.activation_function,
-                'use_batch_norm': args.use_batch_norm,
-                'use_residual': args.use_residual,
-                'L1_weight_norm': args.L1_weight_norm,
-                'L2_weight_norm': args.L2_weight_norm,
-                'scheduler_step_size': args.scheduler_step_size,
-                'scheduler_gamma': args.scheduler_gamma,
-                'loss_type': args.loss_type,
-            }
-            if args.ensemble > 1:
-                for idx in range(args.ensemble):
-                    train_model(
-                        cfg,
-                        args.train_dir,
-                        args.val_dir,
-                        args.test_dir,
-                        mode=args.mode,
-                        max_epochs=args.max_epochs,
-                        num_workers=args.num_workers,
-                        checkpoint_path=args.checkpoint_path,
-                        early_stop=args.early_stop,
-                        early_stop_patience=args.early_stop_patience,
-                        monitor_metric=args.monitor_metric,
-                        monitor_task=args.monitor_task,
-                        ensemble_size=args.ensemble,
-                        ensemble_idx=idx
-                    )
-            else:
+        # assemble config for plain training
+        cfg = {
+            'dim_size':            args.dim_size,
+            'shrinking_scale':     args.shrinking_scale,
+            'num_layers':          args.num_layers,
+            'learning_rate':       args.learning_rate,
+            'batch_size':          args.batch_size,
+            'dropout_rate':        args.dropout_rate,
+            'activation_function': args.activation_function,
+            'use_batch_norm':      args.use_batch_norm,
+            'use_residual':        args.use_residual,
+            'L1_weight_norm':      args.L1_weight_norm,
+            'L2_weight_norm':      args.L2_weight_norm,
+            'scheduler_step_size': args.scheduler_step_size,
+            'scheduler_gamma':     args.scheduler_gamma,
+            'loss_type':           args.loss_type,
+        }
+
+        if args.ensemble > 1:
+            for idx in range(args.ensemble):
                 train_model(
-                    cfg,
-                    args.train_dir,
-                    args.val_dir,
-                    args.test_dir,
-                    mode=args.mode,
-                    max_epochs=args.max_epochs,
-                    num_workers=args.num_workers,
-                    checkpoint_path=args.checkpoint_path,
-                    early_stop=args.early_stop,
-                    early_stop_patience=args.early_stop_patience,
-                    monitor_metric=args.monitor_metric,
-                    monitor_task=args.monitor_task
+                    config                = cfg,
+                    train_dir             = args.train_dir,
+                    val_dir               = args.val_dir,
+                    test_dir              = args.test_dir,
+                    mode                  = args.mode,
+                    max_epochs            = args.max_epochs,
+                    num_workers           = args.num_workers,
+                    checkpoint_path       = args.checkpoint_path,
+                    early_stop            = args.early_stop,
+                    early_stop_patience   = args.early_stop_patience,
+                    monitor_metric        = args.monitor_metric,
+                    monitor_task          = args.monitor_task,
+                    ensemble_size         = args.ensemble,
+                    ensemble_idx          = idx
                 )
+        else:
+            train_model(
+                config              = cfg,
+                train_dir           = args.train_dir,
+                val_dir             = args.val_dir,
+                test_dir            = args.test_dir,
+                mode                = args.mode,
+                max_epochs          = args.max_epochs,
+                num_workers         = args.num_workers,
+                checkpoint_path     = args.checkpoint_path,
+                early_stop          = args.early_stop,
+                early_stop_patience = args.early_stop_patience,
+                monitor_metric      = args.monitor_metric,
+                monitor_task        = args.monitor_task
+            )
+
+if __name__ == "__main__":
+    main()

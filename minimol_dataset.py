@@ -55,7 +55,7 @@ def precompute_features(
     output_dir: str,
     smiles_col: str = "SMILES",
     target_cols: list = None,
-    metadata_keys: list = None,
+    metadata_cols: list = None,
     standardize_smiles: bool = True,
     batch_size: int = 1_000,
     skip_if_exists: bool = True
@@ -69,7 +69,7 @@ def precompute_features(
        - features.pt      (Tensor [N, D])
        - targets.pt       (Tensor [N, T]) if target_cols
        - metadata.csv     (subset of original columns for kept rows)
-       - meta.json        (smiles_col, target_cols, metadata_keys)
+       - meta.json        (smiles_col, target_cols, metadata_cols)
     """
     os.makedirs(output_dir, exist_ok=True)
     feat_path = os.path.join(output_dir, "features.pt")
@@ -95,8 +95,8 @@ def precompute_features(
             raise KeyError(f"Target columns {missing} not in DataFrame")
 
     # default: save *all* columns
-    if metadata_keys is None:
-        metadata_keys = list(df.columns)
+    if metadata_cols is None:
+        metadata_cols = list(df.columns)
 
     # ——— Standardize & initial filter ———
     raw_smiles = []
@@ -166,7 +166,7 @@ def precompute_features(
         torch.save(targets_tensor, os.path.join(output_dir, "targets.pt"))
 
     # subset metadata to only successfully featurized rows and save CSV
-    meta_df = df.loc[kept_positions, metadata_keys]
+    meta_df = df.loc[kept_positions, metadata_cols]
     meta_csv = os.path.join(output_dir, "metadata.csv")
     meta_df.to_csv(meta_csv, index=False)
 
@@ -175,7 +175,7 @@ def precompute_features(
         json.dump({
             "smiles_col": smiles_col,
             "target_cols": target_cols,
-            "metadata_keys": metadata_keys
+            "metadata_cols": metadata_cols
         }, f, indent=2)
 
     print(

@@ -14,3 +14,4 @@ ray_results/
 .pytest_cache
 .vscode
 Acinetobacter
+lightning_logs/
