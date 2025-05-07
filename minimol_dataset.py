@@ -161,9 +161,9 @@ def precompute_features(
         targets_tensor = torch.tensor(np.stack(final_targets), dtype=torch.float32)
 
     # ——— Write out ———
-    torch.save(features_tensor, feat_path)
+    torch.save(features_tensor.cpu(), feat_path)
     if targets_tensor is not None:
-        torch.save(targets_tensor, os.path.join(output_dir, "targets.pt"))
+        torch.save(targets_tensor.cpu(), os.path.join(output_dir, "targets.pt"))
 
     # subset metadata to only successfully featurized rows and save CSV
     meta_df = df.loc[kept_positions, metadata_cols]
@@ -196,8 +196,8 @@ class PrecomputedDataset(Dataset):
         targets_path: str = None,
         metadata_path: str = None,
     ):
-        self.features = torch.load(features_path)
-        self.targets = torch.load(targets_path) if targets_path and os.path.exists(targets_path) else None
+        self.features = torch.load(features_path, map_location='cpu')
+        self.targets = torch.load(targets_path, map_location='cpu') if targets_path and os.path.exists(targets_path) else None
         self.metadata = pd.read_csv(metadata_path) if metadata_path and os.path.exists(metadata_path) else None
 
     def __len__(self):
