@@ -5,6 +5,7 @@ import optuna
 from sklearn.metrics import roc_auc_score, average_precision_score
 from optuna.integration.pytorch_lightning import PyTorchLightningPruningCallback as _OptunaPruningCallback
 import pytorch_lightning as pl
+from pathlib import Path
 
 # wrap so Lightning truly sees it as a pl.Callback subclass
 class PyTorchLightningPruningCallback(_OptunaPruningCallback, pl.Callback):
@@ -62,7 +63,7 @@ class MultiTaskMetricCallback(pl.Callback):
                 metrics[t],
                 on_epoch=True,      # aggregate across the epoch
                 prog_bar=True,      # show in progress bar
-                logger=True         # send to logger → Ray Tune will pick it up
+                logger=False         # log metric for Lightning (and Optuna if using pruning)
             )
 
 
@@ -71,18 +72,18 @@ def train_model(
     train_dir: str,
     val_dir: str,
     test_dir: str,
+    ckpt_root: str,  
     mode: str = 'mtl',
     max_epochs: int = 10,
     num_workers: int = 4,
     checkpoint_path: str = None,
     early_stop: bool = False,
     early_stop_patience: int = 3,
-    monitor_metric: str = 'loss',  # 'loss', 'auroc', or 'auprc'
+    monitor_metric: str = 'loss',
     monitor_task: int = 0,
     ensemble_size: int = 1,
     ensemble_idx: int = 0,
     seed: int = 777, 
-    report_to_ray: bool = False
 ):
     # seed differently for each ensemble member
     if ensemble_size > 1:
@@ -90,9 +91,8 @@ def train_model(
     if ensemble_size < 1:
         print("Warning: ensemble_size can't be smaller than 1, setting to 1")
         ensemble_size =1
-    if num_workers < 1:
-        print("Warning: num_workers can't be smaller than 1, setting to 1")
-        num_workers = 1
+    if num_workers < 0:
+        raise ValueError("num_workers must be ≥ 0")
     if early_stop_patience < 1:
         print("Warning: early_stop_patience can't be smaller than 1, setting to 1")
         early_stop_patience = 1
@@ -137,18 +137,14 @@ def train_model(
     mode_minmax = 'min' if monitor_metric == 'loss' else 'max'
 
     # checkpoint directory and filename
-    if ensemble_size > 1:
-        ckpt_dir = os.path.join(os.getcwd(), 'checkpoints', f'ensemble_{ensemble_idx}')
-        os.makedirs(ckpt_dir, exist_ok=True)
-        ckpt_dir = os.getcwd()
-        filename = f'ensemble{ensemble_idx}-' + "{epoch}-{" + monitor_name + ":.4f}"
-    else:
-        ckpt_dir = None
-        ckpt_dir = os.getcwd()
-        filename = "{epoch}-{" + monitor_name + ":.4f}"
+    run_id = f"ensemble_{ensemble_idx}" if ensemble_size > 1 else "single_run"
+    ckpt_dir = Path(ckpt_root) / run_id
+
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{run_id}-" + "{epoch}-{" + monitor_name + ":.4f}"
 
     ckpt_cb = ModelCheckpoint(
-        dirpath=ckpt_dir,
+        dirpath=str(ckpt_dir),
         filename=filename,
         monitor=monitor_name,
         save_top_k=1,
@@ -172,7 +168,7 @@ def train_model(
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
         enable_progress_bar=False,
-        default_root_dir=ckpt_dir
+        default_root_dir=str(ckpt_dir)
     )
 
     train_loader = dm.train_dataloader()
