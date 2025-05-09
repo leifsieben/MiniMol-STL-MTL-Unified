@@ -123,7 +123,7 @@ class MTL_FFN(pl.LightningModule):
         # unweighted average over all valid tasks
         losses = []
         for t in range(self.hparams.output_dim):
-            mask = y[:,t] >= 0
+            mask = y[:, t] != -1.0
             if mask.any():
                 logits = preds[mask, t]
                 tgt    = y[mask, t].float()
