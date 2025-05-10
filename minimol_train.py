@@ -77,6 +77,7 @@ def train_model(
     max_epochs: int = 10,
     num_workers: int = 4,
     checkpoint_path: str = None,
+    return_metric: bool = False,
     early_stop: bool = False,
     early_stop_patience: int = 3,
     monitor_metric: str = 'loss',
@@ -181,6 +182,13 @@ def train_model(
 
     test_loader = dm.test_dataloader()
     trainer.test(model, dataloaders=test_loader)
+
+    if return_metric:
+        if ckpt_cb.best_model_score is None:
+            print("Warning: No checkpoint saved, returning fallback.")
+            return float("inf") if monitor_metric == "loss" else float("-inf")
+        return ckpt_cb.best_model_score.item()
+
     return ckpt_cb.best_model_path
 
 def run_hyperopt(
@@ -191,7 +199,7 @@ def run_hyperopt(
     n_trials, n_jobs,
     storage_url, study_name="minimol_study"
 ):
-    direction = "minimize" if monitor_metric=="loss" else "maximize"
+    direction = "minimize" if monitor_metric == "loss" else "maximize"
     study = optuna.create_study(
         study_name=study_name,
         direction=direction,
@@ -199,6 +207,7 @@ def run_hyperopt(
         load_if_exists=True,
         pruner=optuna.pruners.MedianPruner()
     )
+
     if num_workers < 1:
         print("Warning: num_workers can't be smaller than 1, setting to 1")
         num_workers = 1
@@ -207,64 +216,48 @@ def run_hyperopt(
         early_stop_patience = 1
 
     def _objective(trial):
-        # 1) sample exactly as before
         cfg = {
-            "dim_size":         trial.suggest_int("dim_size", 128, 4096, log=True),
-            "shrinking_scale":  trial.suggest_float("shrinking_scale", 0.5, 1.0),
-            "num_layers":       trial.suggest_int("num_layers", 1, 10),
-            "learning_rate":    trial.suggest_float("learning_rate", 1e-6, 1e-1, log=True),
-            "batch_size":       trial.suggest_categorical("batch_size", [32,64,128,256]),
-            "dropout_rate":     trial.suggest_float("dropout_rate", 0.0, 0.9),
+            "dim_size": trial.suggest_int("dim_size", 128, 4096, log=True),
+            "shrinking_scale": trial.suggest_float("shrinking_scale", 0.5, 1.0),
+            "num_layers": trial.suggest_int("num_layers", 1, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-1, log=True),
+            "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
+            "dropout_rate": trial.suggest_float("dropout_rate", 0.0, 0.9),
             "activation_function": trial.suggest_categorical(
-                                        "activation_function",
-                                        ['relu','tanh','leaky_relu','gelu']
-                                    ),
-            "use_batch_norm":   trial.suggest_categorical("use_batch_norm",[True,False]),
-            "use_residual":     trial.suggest_categorical("use_residual",[True,False]),
-            "L1_weight_norm":   trial.suggest_float("L1_weight_norm",1e-12,1e-2, log=True),
-            "L2_weight_norm":   trial.suggest_float("L2_weight_norm",1e-8,1e-2, log=True),
-            "scheduler_step_size": trial.suggest_int("scheduler_step_size",1,20),
-            "scheduler_gamma":  trial.suggest_float("scheduler_gamma",0.1,0.9),
-            "loss_type":        "bce_with_logits",
+                "activation_function", ["relu", "tanh", "leaky_relu", "gelu"]
+            ),
+            "use_batch_norm": trial.suggest_categorical("use_batch_norm", [True, False]),
+            "use_residual": trial.suggest_categorical("use_residual", [True, False]),
+            "L1_weight_norm": trial.suggest_float("L1_weight_norm", 1e-12, 1e-2, log=True),
+            "L2_weight_norm": trial.suggest_float("L2_weight_norm", 1e-8, 1e-2, log=True),
+            "scheduler_step_size": trial.suggest_int("scheduler_step_size", 1, 20),
+            "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.1, 0.9),
+            "loss_type": "bce_with_logits",
         }
 
-        # 2) data
-        dm = PrecomputedDataModule(
-            train_dir, val_dir, test_dir,
-            batch_size=cfg["batch_size"],
-            num_workers=num_workers
-        )
-        dm.setup()
-        feats  = torch.load(os.path.join(train_dir, "features.pt"))
-        targs  = torch.load(os.path.join(train_dir, "targets.pt"))
-        in_dim = feats.shape[1]
-        out_dim= (targs.shape[1] if mode=="mtl" else 1)
-
-        # 3) model
-        ModelCls = MTL_FFN if mode=="mtl" else STL_FFN
-        if mode=="mtl":  cfg["output_dim"] = out_dim
-        model = ModelCls(input_dim=in_dim, **cfg)
-
-        # 4) callbacks
-        MON = f"val_{monitor_metric}" + (f"_task_{monitor_task}" if monitor_metric!="loss" else "")
-        ckpt = ModelCheckpoint(monitor=MON, mode=("min" if monitor_metric=="loss" else "max"))
-        es   = EarlyStopping(monitor=MON, patience=early_stop_patience,
-                             mode=("min" if monitor_metric=="loss" else "max"))
-        pruner = PyTorchLightningPruningCallback(trial, monitor=MON)
-
-        trainer = pl.Trainer(
+        best_metric = train_model(
+            config=cfg,
+            train_dir=train_dir,
+            val_dir=val_dir,
+            test_dir=test_dir,
+            ckpt_root="./optuna_checkpoints",
+            mode=mode,
             max_epochs=max_epochs,
-            callbacks=[ckpt, es, pruner],
-            accelerator="gpu" if torch.cuda.is_available() else "cpu",
-            devices=1,
-            enable_progress_bar=False,
+            num_workers=num_workers,
+            early_stop=True,
+            early_stop_patience=early_stop_patience,
+            monitor_metric=monitor_metric,
+            monitor_task=monitor_task,
+            ensemble_size=1,
+            ensemble_idx=0,
+            return_metric=True
         )
-        trainer.fit(model, dm.train_dataloader(), dm.val_dataloader())
-        return ckpt.best_model_score.item()
+        return best_metric
 
     study.optimize(_objective, n_trials=n_trials, n_jobs=n_jobs)
     print("Best params:", study.best_trial.params)
     return study.best_trial.params
+
 
 def main():
     import argparse
