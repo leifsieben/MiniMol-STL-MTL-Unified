@@ -211,7 +211,7 @@ def run_hyperopt(
         cfg = {
             "dim_size":         trial.suggest_int("dim_size", 128, 4096, log=True),
             "shrinking_scale":  trial.suggest_float("shrinking_scale", 0.5, 1.0),
-            "num_layers":       trial.suggest_int("num_layers", 1, 15),
+            "num_layers":       trial.suggest_int("num_layers", 1, 10),
             "learning_rate":    trial.suggest_float("learning_rate", 1e-6, 1e-1, log=True),
             "batch_size":       trial.suggest_categorical("batch_size", [32,64,128,256]),
             "dropout_rate":     trial.suggest_float("dropout_rate", 0.0, 0.9),
