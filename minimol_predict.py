@@ -197,3 +197,207 @@ def predict_batch(
     if output_csv:
         res.to_csv(output_csv, index=False)
     return res
+
+def predict_on_precomputed(
+    X_feat: torch.Tensor,
+    checkpoints,  # str or sequence of str
+    mode: str = 'mtl',
+    species_indices: Optional[Sequence[int]] = None,
+    device: Optional[str] = None,
+    include_individual_models: bool = False
+) -> pd.DataFrame:
+    """
+    Make predictions using precomputed features with ensemble or single model.
+    
+    Parameters:
+    -----------
+    X_feat : torch.Tensor
+        Precomputed features tensor of shape (N, D)
+    checkpoints : str or sequence of str
+        Path(s) to model checkpoint(s)
+    mode : str
+        'mtl' for multi-task or 'stl' for single-task model
+    species_indices : sequence of int, optional
+        Indices of specific tasks/species to extract from MTL predictions
+        If None, include all available tasks
+    device : str, optional
+        Device to use for predictions ('cuda' or 'cpu')
+        If None, will use CUDA if available
+    include_individual_models : bool
+        Whether to include predictions from each individual model
+        
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with columns for mean and std_dev predictions
+        If MTL mode, includes columns for each task
+        If include_individual_models=True, includes columns for each model
+    """
+    # Normalize checkpoints to a list
+    ckpts = checkpoints if isinstance(checkpoints, (list, tuple)) else [checkpoints]
+    
+    # Ensure all checkpoints exist
+    missing = [c for c in ckpts if not os.path.isfile(c)]
+    if missing:
+        raise FileNotFoundError(f"Missing checkpoint files: {', '.join(missing)}")
+
+    # Get predictions using _ensemble_predict
+    preds = _ensemble_predict(X_feat, ckpts, mode=mode, device=device)
+    
+    result_df = pd.DataFrame()
+    
+    # Handle different prediction shapes based on mode
+    if mode == 'mtl':
+        if len(preds.shape) == 3:
+            # Shape [M, N, T]
+            num_models, num_samples, num_tasks = preds.shape
+            
+            # Determine which tasks/species to include
+            if species_indices is None:
+                species_indices = list(range(num_tasks))
+            
+            # Map common species indices to names
+            species_map = {0: "AB", 1: "EC", 2: "KP", 3: "PA"}
+            
+            # Process each requested task/species
+            for idx in species_indices:
+                if idx < num_tasks:
+                    # Get name (if in map) or use task_X notation
+                    name = species_map.get(idx, f"task_{idx}")
+                    
+                    # Extract predictions for this task
+                    task_preds = preds[:, :, idx]  # Shape [M, N]
+                    
+                    # Calculate stats across ensemble members
+                    result_df[f"{name}_mean"] = np.mean(task_preds, axis=0)
+                    result_df[f"{name}_std_dev"] = np.std(task_preds, axis=0)
+                    
+                    # Add individual model predictions if requested
+                    if include_individual_models:
+                        for m in range(num_models):
+                            result_df[f"{name}_model_{m}"] = task_preds[m, :]
+                else:
+                    raise IndexError(f"Species index {idx} out of range (max {num_tasks-1})")
+            
+            # Calculate cross-species metrics if multiple species
+            if len(species_indices) > 1:
+                # Collect mean predictions across specified tasks
+                species_means = np.stack([
+                    result_df[f"{species_map.get(idx, f'task_{idx}')}_mean"].values
+                    for idx in species_indices
+                ], axis=0)
+                
+                # Calculate aggregate metrics
+                result_df["max_across_species"] = np.max(species_means, axis=0)
+                result_df["mean_across_species"] = np.mean(species_means, axis=0)
+                
+        elif len(preds.shape) == 2:
+            # Handle single-task MTL model, shape [M, N]
+            num_models, num_samples = preds.shape
+            
+            result_df["mean"] = np.mean(preds, axis=0)
+            result_df["std_dev"] = np.std(preds, axis=0)
+            
+            # Add individual model predictions if requested
+            if include_individual_models:
+                for m in range(num_models):
+                    result_df[f"model_{m}"] = preds[m, :]
+        
+    elif mode == 'stl':
+        # For STL, shape should be [M, N]
+        if len(preds.shape) == 2:
+            num_models, num_samples = preds.shape
+            
+            # Calculate stats across ensemble members
+            result_df["mean"] = np.mean(preds, axis=0)
+            result_df["std_dev"] = np.std(preds, axis=0)
+            
+            # Add individual model predictions if requested
+            if include_individual_models:
+                for m in range(num_models):
+                    result_df[f"model_{m}"] = preds[m, :]
+        else:
+            raise ValueError(f"Unexpected prediction shape for STL mode: {preds.shape}")
+    
+    return result_df
+
+
+def predict_precomputed_file(
+    precomputed_features_path: str,
+    metadata_csv_path: str,
+    checkpoints,  # str or sequence of str
+    output_path: Optional[str] = None,
+    mode: str = 'mtl',
+    species_indices: Optional[Sequence[int]] = None,
+    device: Optional[str] = None,
+    include_individual_models: bool = False,
+    smiles_col: str = "SMILES"
+) -> pd.DataFrame:
+    """
+    Make predictions on precomputed features stored in a file, and optionally save results.
+    
+    A convenience wrapper around predict_on_precomputed that:
+    1. Loads precomputed features from a file
+    2. Loads metadata from a CSV
+    3. Makes predictions
+    4. Combines predictions with SMILES from metadata
+    5. Optionally saves to a CSV file
+    
+    Parameters:
+    -----------
+    precomputed_features_path : str
+        Path to the precomputed features .pt file
+    metadata_csv_path : str
+        Path to the metadata CSV containing SMILES strings
+    checkpoints : str or sequence of str
+        Path(s) to model checkpoint(s)
+    output_path : str, optional
+        Path to save the predictions CSV
+        If None, results will not be saved to a file
+    mode : str
+        'mtl' for multi-task or 'stl' for single-task model
+    species_indices : sequence of int, optional
+        Indices of specific tasks/species to extract from MTL predictions
+    device : str, optional
+        Device to use for predictions ('cuda' or 'cpu')
+    include_individual_models : bool
+        Whether to include predictions from each individual model
+    smiles_col : str
+        Name of the SMILES column in the metadata CSV
+        
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with SMILES and predictions
+    """
+    # Load precomputed features
+    X_feat = torch.load(precomputed_features_path, map_location="cpu")
+    
+    # Load metadata
+    meta_df = pd.read_csv(metadata_csv_path)
+    
+    # Check dimensions
+    if len(meta_df) != X_feat.shape[0]:
+        raise ValueError(
+            f"Number of samples in metadata ({len(meta_df)}) does not match "
+            f"number of samples in features ({X_feat.shape[0]})"
+        )
+    
+    # Get predictions
+    result_df = predict_on_precomputed(
+        X_feat, 
+        checkpoints, 
+        mode=mode,
+        species_indices=species_indices,
+        device=device,
+        include_individual_models=include_individual_models
+    )
+    
+    # Combine with SMILES
+    result_df.insert(0, smiles_col, meta_df[smiles_col].values)
+    
+    # Save if output path provided
+    if output_path:
+        result_df.to_csv(output_path, index=False)
+    
+    return result_df
