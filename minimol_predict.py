@@ -10,21 +10,35 @@ from minimol_models import STL_FFN, MTL_FFN
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from hydra.core.global_hydra import GlobalHydra
 from typing import Sequence, Optional, Union, Tuple
+from minimol_models import TaskHeadMTL, TaskHeadSTL
 
 def load_model(
     checkpoint_path: str,
     mode: str = 'mtl',
-    device: str = None
+    device: str = None,
+    architecture: str = 'standard'  # New parameter to specify architecture type
 ) -> torch.nn.Module:
     """
-    Load a trained STL or MTL model from either a Lightning checkpoint (.ckpt)
-    or a raw state_dict (.pt). Falls back smoothly if the file lacks PL metadata.
+    Load a trained model from a checkpoint.
+    
+    :param checkpoint_path: Path to the checkpoint file
+    :param mode: 'mtl' for multi-task or 'stl' for single-task model
+    :param device: Device to load the model on ('cuda' or 'cpu')
+    :param architecture: 'standard' for original architecture, 'residual' for colleague's architecture
+    :return: Loaded model
     """
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    ModelCls = MTL_FFN if mode == 'mtl' else STL_FFN
+    
+    # Select model class based on mode and architecture
+    if architecture == 'standard':
+        ModelCls = MTL_FFN if mode == 'mtl' else STL_FFN
+    elif architecture == 'residual':
+        ModelCls = TaskHeadMTL if mode == 'mtl' else TaskHeadSTL
+    else:
+        raise ValueError(f"Unknown architecture: {architecture}")
 
     try:
         # 1) Try full Lightning checkpoint
@@ -38,23 +52,42 @@ def load_model(
         first_w = next(v for k, v in state.items() if v.ndim == 2 and 'weight' in k)
         input_dim = first_w.shape[1]
 
-        # Collect all 1D tensors (bias vectors), ignoring batchnorm stats
-        bias_cands = [
-            v for k, v in state.items()
-            if v.ndim == 1 and 'running' not in k and 'num_batches_tracked' not in k
-        ]
-
-        # Build the model with the right signature
-        if mode == 'mtl':
-            # last bias vector’s length = number of tasks
-            output_dim = bias_cands[-1].shape[0]
-            model = ModelCls(input_dim=input_dim, output_dim=output_dim)
-        elif mode == 'stl':
-            model = ModelCls(input_dim=input_dim)
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-
-        # allow missing/unexpected keys when loading old checkpoints
+        # Use an appropriate way to determine output_dim based on architecture
+        if architecture == 'standard':
+            # Original approach for standard models
+            bias_cands = [
+                v for k, v in state.items()
+                if v.ndim == 1 and 'running' not in k and 'num_batches_tracked' not in k
+            ]
+            output_dim = bias_cands[-1].shape[0] if mode == 'mtl' else 1
+            
+            # Build the model with the right signature
+            if mode == 'mtl':
+                model = ModelCls(input_dim=input_dim, output_dim=output_dim)
+            else:
+                model = ModelCls(input_dim=input_dim)
+                
+        elif architecture == 'residual':
+            # For residual architecture, find the final_dense layer
+            if 'final_dense.weight' in state:
+                final_dense_weight = state['final_dense.weight']
+                output_dim = final_dense_weight.shape[0]
+                hidden_dim = state['layers.0.weight'].shape[0]  # First layer's output dim
+                
+                # Count number of layers
+                num_layers = len([k for k in state.keys() if k.startswith('layers.') and k.endswith('.weight')])
+                
+                # Create model with inferred parameters
+                if mode == 'mtl':
+                    model = ModelCls(input_dim=input_dim, output_dim=output_dim, 
+                                    hidden_dim=hidden_dim, num_layers=num_layers)
+                else:
+                    model = ModelCls(input_dim=input_dim, hidden_dim=hidden_dim, 
+                                    num_layers=num_layers)
+            else:
+                raise ValueError("Cannot infer model structure from checkpoint - no final_dense.weight found")
+                
+        # Allow missing/unexpected keys when loading old checkpoints
         model.load_state_dict(state, strict=False)
 
     # Final touches
@@ -66,19 +99,19 @@ def _ensemble_predict(
     X: torch.Tensor,
     checkpoints: Sequence[str],
     mode: str,
-    device: Optional[str]
+    device: Optional[str] = None,
+    architecture: str = 'standard'  # New parameter
 ) -> np.ndarray:
     """
-    Given a feature tensor X of shape (N, D), load each checkpoint,
-    run model(X), and return an array of shape (M, N, T) or (M, N)
-    where M = len(checkpoints), T = #tasks for MTL (1 for STL).
+    Given a feature tensor X, load each checkpoint, run model(X), and return predictions.
+    
+    :param architecture: 'standard' for original architecture, 'residual' for colleague's
     """
     def single_pred(ckpt):
-        m = load_model(ckpt, mode=mode, device=device)
+        m = load_model(ckpt, mode=mode, device=device, architecture=architecture)
         with torch.no_grad():
             out = m(X.to(next(m.parameters()).device))
             probs = torch.sigmoid(out).cpu().numpy()
-        # ensure shape (N,) or (N, T)
         return probs
 
     from concurrent.futures import ThreadPoolExecutor
@@ -88,14 +121,14 @@ def _ensemble_predict(
     return preds
 
 
-
 def predict_smiles(
     smiles: str,
     checkpoints,                 # str or list
     mode: str = 'mtl',
     device: str = None,
     batch_size: int = 1,
-    aggregated: bool = True      # new!
+    aggregated: bool = True,     
+    architecture: str = 'standard'  # Add this parameter
 ) -> Union[np.ndarray, Tuple[np.ndarray,np.ndarray]]:
     """
     Predict score(s) for a single SMILES string using one or more checkpoints.
@@ -115,7 +148,7 @@ def predict_smiles(
     feats = Minimol(batch_size=batch_size)([std])
     X = torch.stack([f.float().clone().detach() for f in feats])
 
-    preds = _ensemble_predict(X, paths, mode, device)  # shape (M, 1) or (M,1,T)
+    preds = _ensemble_predict(X, paths, mode, device, architecture=architecture)  # shape (M, 1) or (M,1,T)
 
     # collapse model axis
     if aggregated:
@@ -134,7 +167,8 @@ def predict_df(
     mode: str = 'mtl',
     aggregated: bool = False,
     batch_size: int = 10000,
-    device: str = None
+    device: str = None,
+    architecture: str = 'standard'
 ) -> pd.DataFrame:
     paths = checkpoints if isinstance(checkpoints, (list,tuple)) else [checkpoints]
 
@@ -150,7 +184,7 @@ def predict_df(
     feats = Minimol(batch_size=batch_size)(std_valid)
     X = torch.stack([f.float().clone().detach() for f in feats])
 
-    preds = _ensemble_predict(X, paths, mode, device)
+    preds = _ensemble_predict(X, paths, mode, device, architecture=architecture)
     M, N = preds.shape[0], preds.shape[1]
     T = preds.shape[2] if preds.ndim==3 else 1
 
@@ -183,7 +217,8 @@ def predict_batch(
     aggregated: bool = False,
     batch_size: int = 10000,
     device: str = None,
-    output_csv: str = None
+    output_csv: str = None,
+    architecture: str = 'standard'  # Add this parameter
 ):
     df = pd.DataFrame({'SMILES': smiles_list})
     res = predict_df(
@@ -192,7 +227,8 @@ def predict_batch(
         mode             = mode,
         aggregated       = aggregated,
         batch_size       = batch_size,
-        device           = device
+        device           = device,
+        architecture     = architecture
     )
     if output_csv:
         res.to_csv(output_csv, index=False)
@@ -204,7 +240,8 @@ def predict_on_precomputed(
     mode: str = 'mtl',
     species_indices: Optional[Sequence[int]] = None,
     device: Optional[str] = None,
-    include_individual_models: bool = False
+    include_individual_models: bool = False,
+    architecture: str = 'standard'
 ) -> pd.DataFrame:
     """
     Make predictions using precomputed features with ensemble or single model.
@@ -242,7 +279,7 @@ def predict_on_precomputed(
         raise FileNotFoundError(f"Missing checkpoint files: {', '.join(missing)}")
 
     # Get predictions using _ensemble_predict
-    preds = _ensemble_predict(X_feat, ckpts, mode=mode, device=device)
+    preds = _ensemble_predict(X_feat, ckpts, mode=mode, device=device, architecture=architecture)
     
     result_df = pd.DataFrame()
     
@@ -331,7 +368,8 @@ def predict_precomputed_file(
     species_indices: Optional[Sequence[int]] = None,
     device: Optional[str] = None,
     include_individual_models: bool = False,
-    smiles_col: str = "SMILES"
+    smiles_col: str = "SMILES",
+    architecture: str = 'standard' 
 ) -> pd.DataFrame:
     """
     Make predictions on precomputed features stored in a file, and optionally save results.
@@ -390,7 +428,8 @@ def predict_precomputed_file(
         mode=mode,
         species_indices=species_indices,
         device=device,
-        include_individual_models=include_individual_models
+        include_individual_models=include_individual_models,
+        architecture=architecture
     )
     
     # Combine with SMILES
