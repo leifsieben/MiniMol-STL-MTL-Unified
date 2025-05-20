@@ -183,8 +183,7 @@ def train_model(
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
         enable_progress_bar=False,
-        default_root_dir=str(ckpt_dir), 
-        resume_from_checkpoint=None
+        default_root_dir=str(ckpt_dir)
     )
 
     train_loader = dm.train_dataloader()
