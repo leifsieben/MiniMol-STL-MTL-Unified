@@ -85,6 +85,7 @@ def train_model(
     ensemble_size: int = 1,
     ensemble_idx: int = 0,
     seed: int = 777, 
+    task_weights: list = None,
 ):
     # seed differently for each ensemble member
     if ensemble_size > 1:
@@ -97,6 +98,17 @@ def train_model(
     if early_stop_patience < 1:
         print("Warning: early_stop_patience can't be smaller than 1, setting to 1")
         early_stop_patience = 1
+    if task_weights is not None:
+        if mode != 'mtl':
+            print("Warning: task_weights provided but mode is not 'mtl'. Ignoring weights.")
+            task_weights = None
+        else:
+            targs = torch.load(os.path.join(train_dir, 'targets.pt'))
+            num_tasks = targs.shape[1]
+            if len(task_weights) != num_tasks:
+                raise ValueError(f"Number of task weights ({len(task_weights)}) does not match "
+                                f"number of tasks ({num_tasks})")
+            print(f"Using task weights: {task_weights}")
 
     dm = PrecomputedDataModule(
         train_dir, val_dir, test_dir,
@@ -113,6 +125,8 @@ def train_model(
     kwargs = {k: v for k, v in config.items() if k in ModelCls.__init__.__code__.co_varnames}
     if mode == 'mtl':
         kwargs['output_dim'] = output_dim
+        if task_weights is not None:
+            kwargs['task_weights'] = task_weights
     model = ModelCls(input_dim=input_dim, **kwargs)
 
     if checkpoint_path:
@@ -289,7 +303,9 @@ def main():
                         default='loss')
     parser.add_argument('--monitor_task',     type=int, default=0)
     parser.add_argument('--ensemble',         type=int, default=1)
-
+    parser.add_argument('--task_weights', type=float, nargs='+', 
+                        help="Weights for each task in MTL mode (must match number of tasks)")
+    
     # hyperopt (Optuna)
     parser.add_argument('--hyperopt',         action='store_true',
                         help="run Optuna hyperparameter search")
@@ -394,7 +410,8 @@ def main():
                 early_stop          = args.early_stop,
                 early_stop_patience = args.early_stop_patience,
                 monitor_metric      = args.monitor_metric,
-                monitor_task        = args.monitor_task
+                monitor_task        = args.monitor_task,
+                task_weights        =args.task_weights
             )
 
 if __name__ == "__main__":

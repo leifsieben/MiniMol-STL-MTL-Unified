@@ -68,7 +68,7 @@ class STL_FFN(BaseFFN):
         activation_function: str = 'relu', dropout_rate: float = 0.0,
         use_batch_norm: bool = False, use_residual: bool = False,
         scheduler_step_size: int = 5, scheduler_gamma: float = 0.5,
-        loss_type: str = 'bce_with_logits',
+        loss_type: str = 'bce_with_logits', 
     ):
         super().__init__(
             learning_rate, batch_size, L2_weight_norm, L1_weight_norm,
@@ -126,6 +126,53 @@ class STL_FFN(BaseFFN):
     def validation_step(self, b, i): return self._step(b, 'val')
     def test_step(self, b, i): return self._step(b, 'test')
 
+def compute_weighted_task_loss(preds, y, task_weights=None, l1_weight_norm=0, parameters=None):
+    """
+    Utility function to compute weighted loss across tasks.
+    
+    Args:
+        preds: Model predictions (logits)
+        y: Target values with -1 indicating missing labels
+        task_weights: Optional list of weights for each task
+        l1_weight_norm: L1 regularization coefficient
+        parameters: Model parameters for L1 regularization
+        
+    Returns:
+        Weighted average loss across all valid tasks
+    """
+    device = preds.device
+    total_loss = torch.tensor(0.0, device=device)
+    scale_sum = 0.0
+    output_dim = preds.shape[1]
+    
+    for t in range(output_dim):
+        # Mask out unknown labels
+        mask = (y[:, t] >= 0.0)
+        if mask.any():
+            preds_t = preds[mask, t]
+            y_t = y[mask, t].float()
+            
+            loss_t = F.binary_cross_entropy_with_logits(preds_t, y_t, reduction='mean')
+            
+            # Get weight for this task
+            weight = 1.0  # Default weight
+            if task_weights is not None and t < len(task_weights):
+                weight = task_weights[t]
+            
+            total_loss = total_loss + weight * loss_t
+            scale_sum += weight
+    
+    if scale_sum > 0:
+        total_loss = total_loss / scale_sum
+    else:
+        # If there are no valid labels in this batch, produce 0 but keep gradient
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Add L1 regularization if needed
+    if l1_weight_norm > 0 and parameters is not None:
+        total_loss += l1_weight_norm * sum(p.abs().sum() for p in parameters)
+    
+    return total_loss
 
 class MTL_FFN(BaseFFN):
     def __init__(
@@ -136,7 +183,7 @@ class MTL_FFN(BaseFFN):
         activation_function: str = 'relu', dropout_rate: float = 0.0,
         use_batch_norm: bool = False, use_residual: bool = False,
         scheduler_step_size: int = 5, scheduler_gamma: float = 0.5,
-        loss_type: str = 'bce_with_logits', 
+        loss_type: str = 'bce_with_logits', task_weights: list = None,
     ):
         super().__init__(
             learning_rate, batch_size, L2_weight_norm, L1_weight_norm,
@@ -160,20 +207,13 @@ class MTL_FFN(BaseFFN):
         return self.head(_forward_shared(x, self.layers, self.use_residual))
 
     def _compute_loss(self, preds, y):
-        # unweighted average over all valid tasks
-        losses = []
-        for t in range(self.output_dim):
-            mask = y[:, t] != -1.0
-            if mask.any():
-                logits = preds[mask, t]
-                tgt = y[mask, t].float()
-                losses.append(F.binary_cross_entropy_with_logits(logits, tgt))
-        if not losses:
-            return torch.tensor(0.0, device=preds.device, requires_grad=True)
-        loss = torch.stack(losses).mean()
-        if self.L1_weight_norm > 0:
-            loss += self.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
-        return loss
+        return compute_weighted_task_loss(
+            preds=preds, 
+            y=y, 
+            task_weights=self.task_weights if hasattr(self, 'task_weights') else None,
+            l1_weight_norm=self.L1_weight_norm,
+            parameters=self.parameters()
+        )
 
     def training_step(self, b, i): 
         x, y = b['x'], b['y']
@@ -261,6 +301,7 @@ class TaskHeadSTL(BaseTaskHead):
         L1_weight_norm: float = 0.0,
         scheduler_step_size: int = 5, 
         scheduler_gamma: float = 0.5,
+        task_weights: list = None,
     ):
         super().__init__(
             input_dim, hidden_dim, num_layers, dropout_rate,
@@ -332,21 +373,14 @@ class TaskHeadMTL(BaseTaskHead):
         output = self.final_dense(concatenated)
         return output
     
-    # Reuse the _compute_loss method from MTL_FFN
     def _compute_loss(self, preds, y):
-        losses = []
-        for t in range(self.output_dim):
-            mask = y[:, t] != -1.0
-            if mask.any():
-                logits = preds[mask, t]
-                tgt = y[mask, t].float()
-                losses.append(F.binary_cross_entropy_with_logits(logits, tgt))
-        if not losses:
-            return torch.tensor(0.0, device=preds.device, requires_grad=True)
-        loss = torch.stack(losses).mean()
-        if self.hparams.L1_weight_norm > 0:
-            loss += self.hparams.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
-        return loss
+        return compute_weighted_task_loss(
+            preds=preds, 
+            y=y, 
+            task_weights=self.task_weights if hasattr(self, 'task_weights') else None,
+            l1_weight_norm=self.hparams.L1_weight_norm,
+            parameters=self.parameters()
+        )
 
     def training_step(self, b, i): 
         x, y = b['x'], b['y']
