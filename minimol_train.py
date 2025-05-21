@@ -192,6 +192,7 @@ def train_model(
         model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
+        ckpt_path=None
     )
 
     test_loader = dm.test_dataloader()
