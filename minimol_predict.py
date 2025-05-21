@@ -100,7 +100,8 @@ def _ensemble_predict(
     checkpoints: Sequence[str],
     mode: str,
     device: Optional[str] = None,
-    architecture: str = 'standard'  # New parameter
+    architecture: str = 'standard',
+    task_of_interest: Optional[int] = None
 ) -> np.ndarray:
     """
     Given a feature tensor X, load each checkpoint, run model(X), and return predictions.
@@ -117,7 +118,12 @@ def _ensemble_predict(
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=len(checkpoints)) as pool:
         all_preds = pool.map(single_pred, checkpoints)
-        preds = np.stack(list(all_preds), axis=0)
+        preds = np.stack(list(all_preds), axis=0)  # (M, N) or (M, N, T)
+        if mode == 'mtl' and preds.ndim == 3 and task_of_interest is not None:
+            if task_of_interest >= preds.shape[2]:
+                raise IndexError(f"task_of_interest={task_of_interest} out of range for {preds.shape[2]} tasks.")
+            preds = preds[:, :, task_of_interest:task_of_interest+1]  # keep dim for consistent downstream
+
     return preds
 
 
@@ -128,7 +134,8 @@ def predict_smiles(
     device: str = None,
     batch_size: int = 1,
     aggregated: bool = True,     
-    architecture: str = 'standard'  # Add this parameter
+    architecture: str = 'standard', 
+    task_of_interest: Optional[int] = None
 ) -> Union[np.ndarray, Tuple[np.ndarray,np.ndarray]]:
     """
     Predict score(s) for a single SMILES string using one or more checkpoints.
@@ -148,7 +155,7 @@ def predict_smiles(
     feats = Minimol(batch_size=batch_size)([std])
     X = torch.stack([f.float().clone().detach() for f in feats])
 
-    preds = _ensemble_predict(X, paths, mode, device, architecture=architecture)  # shape (M, 1) or (M,1,T)
+    preds = _ensemble_predict(X, paths, mode, device, architecture=architecture, task_of_interest=task_of_interest)  # shape (M, 1) or (M,1,T)
 
     # collapse model axis
     if aggregated:
@@ -168,7 +175,8 @@ def predict_df(
     aggregated: bool = False,
     batch_size: int = 10000,
     device: str = None,
-    architecture: str = 'standard'
+    architecture: str = 'standard',
+    task_of_interest: Optional[int] = None
 ) -> pd.DataFrame:
     paths = checkpoints if isinstance(checkpoints, (list,tuple)) else [checkpoints]
 
@@ -184,7 +192,7 @@ def predict_df(
     feats = Minimol(batch_size=batch_size)(std_valid)
     X = torch.stack([f.float().clone().detach() for f in feats])
 
-    preds = _ensemble_predict(X, paths, mode, device, architecture=architecture)
+    preds = _ensemble_predict(X, paths, mode, device, architecture=architecture, task_of_interest=task_of_interest)
     M, N = preds.shape[0], preds.shape[1]
     T = preds.shape[2] if preds.ndim==3 else 1
 
@@ -192,7 +200,8 @@ def predict_df(
     if aggregated:
         mean = preds.mean(axis=0)   # (N,T) or (N,)
         std  = preds.std(axis=0)
-        for t in range(T):
+        task_indices = [task_of_interest] if task_of_interest is not None else range(T)
+        for t in task_indices:
             cm, cs = f"pred_mean_task_{t}", f"pred_std_task_{t}"
             out[cm], out[cs] = np.nan, np.nan
             for j, idx in enumerate(valid_idx):
@@ -200,7 +209,8 @@ def predict_df(
                 out.at[idx, cs] = std[j,t]  if T>1 else std[j]
     else:
         for m in range(M):
-            for t in range(T):
+            task_indices = [task_of_interest] if task_of_interest is not None else range(T)
+            for t in task_indices:
                 col = f"pred_model_{m}_task_{t}"
                 out[col] = np.nan
                 for j, idx in enumerate(valid_idx):
@@ -218,7 +228,8 @@ def predict_batch(
     batch_size: int = 10000,
     device: str = None,
     output_csv: str = None,
-    architecture: str = 'standard'  # Add this parameter
+    architecture: str = 'standard', 
+    task_of_interest: Optional[int] = None
 ):
     df = pd.DataFrame({'SMILES': smiles_list})
     res = predict_df(
@@ -228,7 +239,8 @@ def predict_batch(
         aggregated       = aggregated,
         batch_size       = batch_size,
         device           = device,
-        architecture     = architecture
+        architecture     = architecture, 
+        task_of_interest = task_of_interest
     )
     if output_csv:
         res.to_csv(output_csv, index=False)
@@ -241,7 +253,8 @@ def predict_on_precomputed(
     species_indices: Optional[Sequence[int]] = None,
     device: Optional[str] = None,
     include_individual_models: bool = False,
-    architecture: str = 'standard'
+    architecture: str = 'standard',
+    task_of_interest: Optional[int] = None,  
 ) -> pd.DataFrame:
     """
     Make predictions using precomputed features with ensemble or single model.
@@ -278,6 +291,12 @@ def predict_on_precomputed(
     if missing:
         raise FileNotFoundError(f"Missing checkpoint files: {', '.join(missing)}")
 
+    # If task_of_interest is set, override species_indices
+    if task_of_interest is not None:
+        if mode != 'mtl':
+            raise ValueError("task_of_interest is only supported in 'mtl' mode.")
+        species_indices = [task_of_interest]
+
     # Get predictions using _ensemble_predict
     preds = _ensemble_predict(X_feat, ckpts, mode=mode, device=device, architecture=architecture)
     
@@ -286,6 +305,11 @@ def predict_on_precomputed(
     # Handle different prediction shapes based on mode
     if mode == 'mtl':
         if len(preds.shape) == 3:
+            if task_of_interest is not None:
+                max_task_idx = preds.shape[2] - 1
+                if task_of_interest > max_task_idx:
+                    raise IndexError(f"task_of_interest={task_of_interest} is out of bounds for model with {max_task_idx + 1} tasks.")
+
             # Shape [M, N, T]
             num_models, num_samples, num_tasks = preds.shape
             
@@ -369,7 +393,8 @@ def predict_precomputed_file(
     device: Optional[str] = None,
     include_individual_models: bool = False,
     smiles_col: str = "SMILES",
-    architecture: str = 'standard' 
+    architecture: str = 'standard',
+    task_of_interest: Optional[int] = None 
 ) -> pd.DataFrame:
     """
     Make predictions on precomputed features stored in a file, and optionally save results.
@@ -429,7 +454,8 @@ def predict_precomputed_file(
         species_indices=species_indices,
         device=device,
         include_individual_models=include_individual_models,
-        architecture=architecture
+        architecture=architecture, 
+        task_of_interest=task_of_interest
     )
     
     # Combine with SMILES
