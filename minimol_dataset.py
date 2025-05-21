@@ -11,6 +11,7 @@ from rdkit import RDLogger
 from rdkit.Chem.MolStandardize import rdMolStandardize
 from minimol import Minimol
 from hydra.core.global_hydra import GlobalHydra
+from torch.utils.data import DataLoader, Subset
 
 # Suppress RDKit warnings
 RDLogger.DisableLog("rdApp.*")
@@ -211,40 +212,72 @@ class PrecomputedDataset(Dataset):
             sample.update(self.metadata.iloc[idx].to_dict())
         return sample
 
+from torch.utils.data import DataLoader, Subset
+import os
+import torch
+import numpy as np
+
 class PrecomputedDataModule:
     """
-    Simple loader for precomputed train/val/test directories.
+    Simple loader for precomputed train/val/test directories, with optional
+    fallback to train/val split from train_dir.
     """
     def __init__(
         self,
         train_dir: str,
-        val_dir: str,
-        test_dir: str,
+        val_dir: str = None,
+        test_dir: str = None,
         batch_size: int = 32,
         num_workers: int = 4,
+        val_split_ratio: float = 0.2,
+        split_seed: int = 42,
     ):
         self.train_dir = train_dir
         self.val_dir = val_dir
         self.test_dir = test_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.val_split_ratio = val_split_ratio
+        self.split_seed = split_seed
+
+        self.train_ds = None
+        self.val_ds = None
+        self.test_ds = None
 
     def setup(self, stage=None):
-        self.train_ds = PrecomputedDataset(
+        # Always load full training set
+        full_train_ds = PrecomputedDataset(
             os.path.join(self.train_dir, "features.pt"),
             os.path.join(self.train_dir, "targets.pt"),
             os.path.join(self.train_dir, "metadata.csv"),
         )
-        self.val_ds = PrecomputedDataset(
-            os.path.join(self.val_dir, "features.pt"),
-            os.path.join(self.val_dir, "targets.pt"),
-            os.path.join(self.val_dir, "metadata.csv"),
-        )
-        self.test_ds = PrecomputedDataset(
-            os.path.join(self.test_dir, "features.pt"),
-            os.path.join(self.test_dir, "targets.pt"),
-            os.path.join(self.test_dir, "metadata.csv"),
-        )
+
+        if self.val_dir is not None:
+            # Use separate val directory
+            self.train_ds = full_train_ds
+            self.val_ds = PrecomputedDataset(
+                os.path.join(self.val_dir, "features.pt"),
+                os.path.join(self.val_dir, "targets.pt"),
+                os.path.join(self.val_dir, "metadata.csv"),
+            )
+        else:
+            # Do train/val split
+            total = len(full_train_ds)
+            indices = np.arange(total)
+            np.random.seed(self.split_seed)
+            np.random.shuffle(indices)
+            split = int(total * (1 - self.val_split_ratio))
+            train_indices = indices[:split]
+            val_indices = indices[split:]
+            self.train_ds = Subset(full_train_ds, train_indices)
+            self.val_ds = Subset(full_train_ds, val_indices)
+
+        if self.test_dir is not None:
+            self.test_ds = PrecomputedDataset(
+                os.path.join(self.test_dir, "features.pt"),
+                os.path.join(self.test_dir, "targets.pt"),
+                os.path.join(self.test_dir, "metadata.csv"),
+            )
 
     def train_dataloader(self):
         return DataLoader(
@@ -269,6 +302,8 @@ class PrecomputedDataModule:
         )
 
     def test_dataloader(self):
+        if self.test_ds is None:
+            raise ValueError("test_dir was not provided, test_ds is undefined.")
         return DataLoader(
             self.test_ds,
             batch_size=self.batch_size,
@@ -277,5 +312,4 @@ class PrecomputedDataModule:
             persistent_workers=self.num_workers > 0,
             pin_memory=self.num_workers > 0,
             drop_last=True,
-
         )

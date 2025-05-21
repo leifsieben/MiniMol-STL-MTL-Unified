@@ -6,6 +6,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from optuna.integration.pytorch_lightning import PyTorchLightningPruningCallback as _OptunaPruningCallback
 import pytorch_lightning as pl
 from pathlib import Path
+from typing import Optional
 
 # wrap so Lightning truly sees it as a pl.Callback subclass
 class PyTorchLightningPruningCallback(_OptunaPruningCallback, pl.Callback):
@@ -71,7 +72,6 @@ def train_model(
     config,
     train_dir: str,
     val_dir: str,
-    test_dir: str,
     ckpt_root: str,  
     mode: str = 'mtl',
     max_epochs: int = 10,
@@ -81,11 +81,14 @@ def train_model(
     early_stop: bool = False,
     early_stop_patience: int = 3,
     monitor_metric: str = 'loss',
+    val_split_ratio: float = 0.2,
+    split_seed: int = 777,
     monitor_task: int = 0,
     ensemble_size: int = 1,
     ensemble_idx: int = 0,
     seed: int = 777, 
     task_weights: list = None,
+    test_dir: Optional[str] = None,
 ):
     # seed differently for each ensemble member
     if ensemble_size > 1:
@@ -111,8 +114,13 @@ def train_model(
             print(f"Using task weights: {task_weights}")
 
     dm = PrecomputedDataModule(
-        train_dir, val_dir, test_dir,
-        batch_size=config['batch_size'], num_workers=num_workers
+        train_dir=train_dir,
+        val_dir=val_dir if val_dir else None,
+        test_dir=test_dir if test_dir else None,
+        batch_size=config['batch_size'],
+        num_workers=num_workers,
+        val_split_ratio=val_split_ratio if val_dir is None else None,
+        split_seed=split_seed,  # different for each trial
     )
     dm.setup()
 
@@ -195,9 +203,6 @@ def train_model(
         ckpt_path=None
     )
 
-    test_loader = dm.test_dataloader()
-    trainer.test(model, dataloaders=test_loader)
-
     if return_metric:
         if ckpt_cb.best_model_score is None:
             print("Warning: No checkpoint saved, returning fallback.")
@@ -207,7 +212,7 @@ def train_model(
     return ckpt_cb.best_model_path
 
 def run_hyperopt(
-    train_dir, val_dir, test_dir,
+    train_dir, val_dir,
     mode, max_epochs, num_workers,
     monitor_metric, monitor_task,
     early_stop_patience,
@@ -254,7 +259,6 @@ def run_hyperopt(
             config=cfg,
             train_dir=train_dir,
             val_dir=val_dir,
-            test_dir=test_dir,
             ckpt_root="./optuna_checkpoints",
             mode=mode,
             max_epochs=max_epochs,
@@ -263,6 +267,8 @@ def run_hyperopt(
             early_stop_patience=early_stop_patience,
             monitor_metric=monitor_metric,
             monitor_task=monitor_task,
+            split_seed=trial.number + 42, # different split per trial
+            val_split_ratio=0.2,
             ensemble_size=1,
             ensemble_idx=0,
             return_metric=True
@@ -282,8 +288,8 @@ def main():
     # core directories & mode
     parser.add_argument('--mode',        choices=['stl','mtl'], required=True)
     parser.add_argument('--train_dir',   required=True)
-    parser.add_argument('--val_dir',     required=True)
-    parser.add_argument('--test_dir',    required=True)
+    parser.add_argument('--val_dir')
+    parser.add_argument('--test_dir')
 
     # precompute
     parser.add_argument('--precompute',      action='store_true')
@@ -348,7 +354,6 @@ def main():
         best_params = run_hyperopt(
             train_dir           = args.train_dir,
             val_dir             = args.val_dir,
-            test_dir            = args.test_dir,
             mode                = args.mode,
             max_epochs          = args.max_epochs,
             num_workers         = args.num_workers,
