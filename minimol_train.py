@@ -211,13 +211,20 @@ def train_model(
 
     return ckpt_cb.best_model_path
 
+
 def run_hyperopt(
-    train_dir, val_dir,
-    mode, max_epochs, num_workers,
-    monitor_metric, monitor_task,
-    early_stop_patience,
-    n_trials, n_jobs,
-    storage_url, study_name="minimol_study"
+    train_dir: str,
+    val_dir: Optional[str] = None, 
+    mode: str = 'mtl',
+    max_epochs: int = 10,
+    num_workers: int = 4,
+    monitor_metric: str = 'loss',
+    monitor_task: int = 0,
+    early_stop_patience: int = 5,
+    n_trials: int = 50,
+    n_jobs: int = 1,
+    storage_url: str = 'sqlite:///optuna.db',
+    study_name: str = "minimol_study"
 ):
     direction = "minimize" if monitor_metric == "loss" else "maximize"
     study = optuna.create_study(
