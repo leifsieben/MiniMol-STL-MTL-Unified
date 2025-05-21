@@ -260,6 +260,7 @@ def run_hyperopt(
             "scheduler_step_size": trial.suggest_int("scheduler_step_size", 1, 20),
             "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.1, 0.9),
             "loss_type": "bce_with_logits",
+            "use_residual": trial.suggest_categorical("use_residual", [True, False]),
         }
 
         best_metric = train_model(
@@ -346,6 +347,7 @@ def main():
     parser.add_argument('--scheduler_step_size', type=int, default=5)
     parser.add_argument('--scheduler_gamma',   type=float, default=0.5)
     parser.add_argument('--loss_type',         type=str, default='bce_with_logits')
+    parser.add_argument('--use_residual', action='store_true')
 
     args = parser.parse_args()
 
@@ -370,6 +372,7 @@ def main():
             n_trials            = args.n_trials,
             n_jobs              = args.n_jobs,
             storage_url         = args.optuna_storage,
+            use_residual        = args.use_residual,
         )
         print("Optuna best hyperparameters:", best_params)
 
@@ -384,12 +387,12 @@ def main():
             'dropout_rate':        args.dropout_rate,
             'activation_function': args.activation_function,
             'use_batch_norm':      args.use_batch_norm,
-            'use_residual':        args.use_residual,
             'L1_weight_norm':      args.L1_weight_norm,
             'L2_weight_norm':      args.L2_weight_norm,
             'scheduler_step_size': args.scheduler_step_size,
             'scheduler_gamma':     args.scheduler_gamma,
             'loss_type':           args.loss_type,
+            'use_residual': args.use_residual,
         }
 
         if args.ensemble > 1:
