@@ -93,24 +93,18 @@ class STL_FFN(BaseFFN):
 
     def _step(self, batch, stage):
         x = batch['x']
-        # pull targets onto the right device and dtype
         y = batch['y'].to(self.device).float()
-        # if y is (batch,1) squeeze to (batch,)
         if y.ndim == 2 and y.size(1) == 1:
             y = y.squeeze(1)
-        # if somehow you ended up with a scalar, bump it to a 1-element batch
         elif y.ndim == 0:
-            y = y.unsqueeze(0)        
+            y = y.unsqueeze(0)
 
         logits = self(x)
         if logits.ndim == 2 and logits.size(1) == 1:
             logits = logits.squeeze(1)
-        # your forward already does .squeeze(-1), so logits should be (batch,)
-        loss = F.binary_cross_entropy_with_logits(logits, y)
 
-        if self.L1_weight_norm > 0:
-            loss += self.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
-        # for both train and val, log per-epoch; show prog_bar only on val
+        loss = self._compute_loss(logits, y)
+
         batch_size = x.size(0)
         self.log(
             f"{stage}_loss",
@@ -120,6 +114,12 @@ class STL_FFN(BaseFFN):
             prog_bar=(stage == "val"),
             on_step=False
         )
+        return loss
+    
+    def _compute_loss(self, logits, y):
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        if self.L1_weight_norm > 0:
+            loss += self.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
         return loss
 
     def training_step(self, b, i): return self._step(b, 'train')
@@ -329,15 +329,19 @@ class TaskHeadSTL(BaseTaskHead):
         if logits.ndim == 2 and logits.size(1) == 1:
             logits = logits.squeeze(1)
 
-        loss = F.binary_cross_entropy_with_logits(logits, y)
-        if self.hparams.L1_weight_norm > 0:
-            loss += self.hparams.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
+        loss = self._compute_loss(logits, y)
 
         batch_size = x.size(0)
         self.log(
             f"{stage}_loss", loss, batch_size=batch_size,
             on_epoch=True, prog_bar=(stage == "val"), on_step=False
         )
+        return loss
+    
+    def _compute_loss(self, logits, y):
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        if self.hparams.L1_weight_norm > 0:
+            loss += self.hparams.L1_weight_norm * sum(p.abs().sum() for p in self.parameters())
         return loss
 
     def training_step(self, b, i): return self._step(b, 'train')
