@@ -67,6 +67,37 @@ class MultiTaskMetricCallback(pl.Callback):
                 logger=False         # log metric for Lightning (and Optuna if using pruning)
             )
 
+class SingleTaskMetricCallback(pl.Callback):
+    def __init__(self, metric_type: str, val_dataloader):
+        self.metric_type = metric_type
+        self.val_dataloader = val_dataloader
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        pl_module.eval()
+        all_preds, all_targs = [], []
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                x = batch['x'].to(pl_module.device)
+                y = batch['y'].to(pl_module.device)
+                logits = pl_module(x)
+                preds = torch.sigmoid(logits).cpu()
+                all_preds.append(preds)
+                all_targs.append(y.cpu())
+
+        preds = torch.cat(all_preds).numpy().flatten()
+        targs = torch.cat(all_targs).numpy().flatten()
+
+        if self.metric_type == "auroc":
+            score = roc_auc_score(targs, preds)
+        elif self.metric_type == "auprc":
+            score = average_precision_score(targs, preds)
+        else:
+            raise ValueError(f"Unsupported metric type: {self.metric_type}")
+
+        name = f"val_{self.metric_type}"
+        trainer.logger.log_metrics({name: score}, step=trainer.global_step)
+        pl_module.log(name, score, on_epoch=True, prog_bar=True, logger=True)
+
 
 def train_model(
     config,
@@ -142,15 +173,23 @@ def train_model(
 
     callbacks = []
     # metric callbacks (only for MTL, pass in the val loader)
-    if mode == 'mtl' and monitor_metric in ['auroc', 'auprc']:
-        val_loader = dm.val_dataloader()
-        callbacks.append(
-            MultiTaskMetricCallback(
-                metric_type   = monitor_metric,
-                monitor_tasks = [monitor_task],
-                val_dataloader= val_loader
+    val_loader = dm.val_dataloader()
+    if monitor_metric in ['auroc', 'auprc']:
+        if mode == 'mtl':
+            callbacks.append(
+                MultiTaskMetricCallback(
+                    metric_type   = monitor_metric,
+                    monitor_tasks = [monitor_task],
+                    val_dataloader= val_loader
+                )
             )
-        )
+        else:  # STL
+            callbacks.append(
+                SingleTaskMetricCallback(
+                    metric_type=monitor_metric,
+                    val_dataloader=val_loader
+                )
+            )
 
     # define monitor name and mode
     monitor_name = (
