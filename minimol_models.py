@@ -112,7 +112,7 @@ class STL_FFN(BaseFFN):
             batch_size=batch_size,
             on_epoch=True,
             prog_bar=(stage == "val"),
-            on_step=False
+            on_step=True,
         )
         return loss
     
