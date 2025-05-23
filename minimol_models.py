@@ -113,6 +113,7 @@ class STL_FFN(BaseFFN):
             on_epoch=True,
             prog_bar=(stage == "val"),
             on_step=True,
+            logger=True
         )
         return loss
     
@@ -219,19 +220,19 @@ class MTL_FFN(BaseFFN):
         x, y = b['x'], b['y']
         batch_size = x.size(0)
         loss = self._compute_loss(self(x), y)
-        self.log('train_loss', loss, batch_size=batch_size)
+        self.log('train_loss', loss, batch_size=batch_size, logger=True)
         return loss
         
     def validation_step(self, batch, batch_idx):
         x, y = batch['x'], batch['y']
         loss = self._compute_loss(self(x), y)
-        self.log('val_loss', loss, batch_size=x.size(0), on_epoch=True, prog_bar=True)
+        self.log('val_loss', loss, batch_size=x.size(0), on_epoch=True, prog_bar=True, on_step=True, logger=True)
         
     def test_step(self, b, i): 
         x, y = b['x'], b['y']
         batch_size = x.size(0)
         loss = self._compute_loss(self(x), y)
-        self.log('test_loss', loss, batch_size=batch_size)
+        self.log('test_loss', loss, batch_size=batch_size, logger=True)
 
 
 class BaseTaskHead(BaseFFN):
@@ -334,7 +335,7 @@ class TaskHeadSTL(BaseTaskHead):
         batch_size = x.size(0)
         self.log(
             f"{stage}_loss", loss, batch_size=batch_size,
-            on_epoch=True, prog_bar=(stage == "val"), on_step=False
+            on_epoch=True, prog_bar=(stage == "val"), on_step=True, logger=True
         )
         return loss
     
@@ -390,16 +391,16 @@ class TaskHeadMTL(BaseTaskHead):
         x, y = b['x'], b['y']
         batch_size = x.size(0)
         loss = self._compute_loss(self(x), y)
-        self.log('train_loss', loss, batch_size=batch_size)
+        self.log('train_loss', loss, batch_size=batch_size, logger=True)
         return loss
         
     def validation_step(self, batch, batch_idx):
         x, y = batch['x'], batch['y']
         loss = self._compute_loss(self(x), y)
-        self.log('val_loss', loss, batch_size=x.size(0), on_epoch=True, prog_bar=True)
+        self.log('val_loss', loss, batch_size=x.size(0), on_epoch=True, prog_bar=True, logger=True)
         
     def test_step(self, b, i): 
         x, y = b['x'], b['y']
         batch_size = x.size(0)
         loss = self._compute_loss(self(x), y)
-        self.log('test_loss', loss, batch_size=batch_size)
+        self.log('test_loss', loss, batch_size=batch_size, logger=True)
