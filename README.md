@@ -43,40 +43,36 @@ from minimol_dataset import precompute_features
 import pandas as pd
 
 df = pd.DataFrame({
-  "SMILES":   ["CCO", "CCC", "CCN"],
-  "Activity": [0,    1,     0]
+    "SMILES":   ["CCO", "CCC", "CCN"],
+    "Activity": [0,      1,     0]
 })
 
 precompute_features(
-  input_data=df,
-  output_dir="data/train",
-  smiles_col="SMILES",
-  target_cols=["Activity"],
-  save_smiles=True,
-  standardize_smiles=True,
-  batch_size=100
+    input_data=df,
+    output_dir="data/train",      # will be created if missing
+    smiles_col="SMILES",          # defaults to "SMILES"
+    target_cols=["Activity"],     # optional – pass `None` for inference-only
+    metadata_cols=None,           # keep *all* original columns
+    standardize_smiles=True,      # canonicalises & de-duplicates
+    batch_size=1024               # default 1 000
 )
-```
-```bash
-python minimol_train.py --precompute \
-  --input_tsv data.csv \
-  --fingerprint_col SMILES \
-  --target_cols Activity \
-  --output_dir data/train
+
 ```
 
 Output directory structure:
 ```
 data/train/
-├── features.pt        # FloatTensor [N, D]
-├── targets.pt         # FloatTensor [N, T]
-├── metadata.csv       # SMILES strings
-└── meta.json          # Configuration
+├── features.pt     # torch.FloatTensor [N, D]
+├── targets.pt      # torch.FloatTensor [N, T]  (only if target_cols given)
+├── metadata.csv    # original rows that were successfully featurised
+└── meta.json       # stores smiles_col / target_cols / metadata_cols
 ```
 
 ---
 
 ## 🚀 Training Models
+
+You can use the flag  --use_residual (CLI) or use_residual=True (Python) – to move from the original “plain” feed-forward network to a residual (skip-connected) variant.
 
 ### Single-Task Model (STL)
 
@@ -89,31 +85,33 @@ python minimol_train.py \
   --max_epochs 20 \
   --batch_size 64 \
   --learning_rate 1e-3 \
-  --monitor_metric loss
+  --monitor_metric auroc \
+  --use_residual        # <-- add this flag for the residual net
 ```
 ```python
 from minimol_train import train_model
 
-cfg = {
-  "batch_size":     64,
-  "learning_rate":  1e-3,
-  "dim_size":       128,
-  "shrinking_scale":0.5,
-  "num_layers":     3,
-  "dropout_rate":   0.1,
-  "activation_function":"relu",
-  "use_batch_norm": True,
-  "use_residual":   False,
-}
+cfg = dict(
+    dim_size=128,
+    shrinking_scale=0.5,
+    num_layers=3,
+    dropout_rate=0.1,
+    activation_function="relu",
+    use_batch_norm=True,
+    learning_rate=1e-3,
+    batch_size=64,
+    use_residual=True,        # <-- toggle here
+)
 
-# STL:
 train_model(
-  config=cfg,
-  train_dir="data/train",
-  val_dir="data/val",
-  test_dir="data/test",
-  mode="stl",
-  max_epochs=20
+    config       = cfg,
+    train_dir    = "data/train",
+    val_dir      = "data/val",
+    test_dir     = "data/test",
+    ckpt_root    = "checkpoints/stl",   # required positional arg now :contentReference[oaicite:1]{index=1}
+    mode         = "stl",
+    max_epochs   = 20,
+    monitor_metric="auroc"
 )
 ```
 
@@ -124,29 +122,37 @@ python minimol_train.py \
   --mode mtl \
   --train_dir data/train \
   --val_dir data/val \
-  --test_dir data/test \
   --max_epochs 30 \
   --batch_size 128 \
   --learning_rate 5e-4 \
-  --monitor_metric auroc \
-  --monitor_task 0
-```
+  --monitor_metric auprc \
+  --monitor_task 0     # <-- by default doesn't uses standard FFN architecture
+  ```
 
 ```python
 # MTL:
 train_model(
-  config=cfg,
-  train_dir="data/train",
-  val_dir="data/val",
-  test_dir="data/test",
-  mode="mtl",
-  max_epochs=30,
-  monitor_metric="auroc",
-  monitor_task=0
+    config          = cfg,
+    train_dir       = "data/train",
+    val_dir         = "data/val",
+    ckpt_root       = "checkpoints/mtl",
+    mode            = "mtl",
+    max_epochs      = 30,
+    monitor_metric  = "auprc",
+    monitor_task    = 0,          # which task to watch for “best model”
+    use_residual    = True
 )
 ```
 
-Checkpoints are saved automatically in the working directory with the best monitored metric.
+Checkpoints are saved automatically in the working directory with the best monitored metric. Models land in
+```
+<ckpt_root>/
+  single_run/          # or ensemble_{i}/
+    epoch=...-val_auroc_task_0=0.9339.ckpt
+    last.ckpt
+```
+
+Ensembles: --ensemble 5 trains ensemble_0 … ensemble_4 with independent seeds; predictions can later be averaged via minimol_predict.py.
 
 ---
 
@@ -156,34 +162,33 @@ Checkpoints are saved automatically in the working directory with the best monit
 python minimol_train.py \
   --mode stl \
   --train_dir data/train \
-  --val_dir data/val \
-  --test_dir data/test \
-  --hyperopt \
-  --hyperopt_num_samples 50 \
-  --max_epochs 10 \
-  --cpus_per_trial 2 \
-  --gpus_per_trial 1 \
-  --tune_dir ray_results
+  --val_dir   data/val \
+  --hyperopt               \        # activate Optuna search
+  --n_trials 50            \        # <-- was --hyperopt_num_samples
+  --max_epochs 10          \
+  --num_workers 4          \        # dataloader workers, not CPU cores
+  --monitor_metric auroc   \        # optimise AUROC instead of loss
+  --use_residual                    # let Optuna try the residual net
+
 ```
 
 ```python
 from minimol_train import run_hyperopt
 
-best_config = run_hyperopt(
-  train_dir="data/train",
-  val_dir="data/val",
-  test_dir="data/test",
-  mode="stl",
-  max_epochs=5,
-  hyperopt_num_samples=20,
-  cpus_per_trial=1,
-  gpus_per_trial=0,
-  tune_dir="./ray_results"
+best_params = run_hyperopt(
+    train_dir   = "data/train",
+    val_dir     = "data/val",
+    mode        = "stl",
+    max_epochs  = 10,
+    n_trials    = 20,
+    num_workers = 4,
+    monitor_metric = "auroc",
+    use_residual   = True      # search the residual variant too
 )
-print("🏆 Best hyperparameters:", best_config)
+print("🏆 Best hyper-parameters:", best_params)
 ```
 
-Results and best configuration are logged via Ray Tune.
+Results and best configuration are logged via Optuna and lightning. 
 
 ---
 
@@ -194,31 +199,51 @@ Results and best configuration are logged via Ray Tune.
 ```python
 from minimol_predict import predict_smiles
 
-ckpt_path = "best_model.ckpt"
-predictions = predict_smiles("CCO", ckpt_path, mode='stl')
-print(predictions)  # numpy array of shape (1,)
+ckpt = "best_model.ckpt"                # or a *list* of ckpts for an ensemble
+score = predict_smiles(
+    "CCO",
+    checkpoints = ckpt,                 # str | list[str]
+    mode        = "stl",                # "stl" | "mtl"
+    aggregated  = True,                 # default → mean across models
+    architecture= "standard",           # "standard" | "residual"
+)
+print(score)   # scalar (STL) or 1-D array (MTL)
 ```
 
 ### Batch prediction with DataFrame
 
 ```python
-from minimol_predict import predict_smiles, predict_df
+from minimol_predict import predict_df
 import pandas as pd
 
-# Single SMILES
-pred = predict_smiles("CCO", "best_model.ckpt", mode="stl")
-print(pred)  # numpy array
+df = pd.DataFrame({"SMILES": ["CCC", "CCN", "COC"]})
 
-# Batch via DataFrame
-df_new = pd.DataFrame({"SMILES": ["CCC","CCN","COC"]})
 out = predict_df(
-  df_new,
-  smiles_col="SMILES",
-  checkpoint_path="best_model.ckpt",
-  mode="mtl",
-  aggregated=False
+    df,
+    smiles_col       = "SMILES",
+    checkpoints      = ["ens0.ckpt", "ens1.ckpt"],   # ⇦ ensemble
+    mode             = "mtl",
+    aggregated       = True,         # mean / std columns
+    architecture     = "residual",   # load residual checkpoints
+    task_of_interest = 0             # (optional) slice a single task
 )
-print(out)
+print(out.head())
+```
+
+### Predicting on pre-computed features tensor
+
+```python
+from minimol_predict import predict_on_precomputed
+
+X = torch.load("data/train/features.pt")        # [N, D] tensor
+preds = predict_on_precomputed(
+    X,
+    checkpoints   = ["ens0.ckpt", "ens1.ckpt"],
+    mode          = "mtl",
+    species_indices = [0, 3],    # pick tasks 0 & 3
+    include_individual_models = False
+)
+
 ```
 
 Output DataFrame contains original SMILES and `pred_model_{i}_task_{j}` columns.
@@ -227,76 +252,130 @@ Output DataFrame contains original SMILES and `pred_model_{i}_task_{j}` columns.
 
 ## 🎯 End-to-End Example
 
+This is an example for a STL model with residual-skip connections, monitoring the AUPRC metric. It performs the train/val split internally with the default split of 80-20. 
+
 ```bash
-# 1) Precompute
+########################################
+# 1) Pre-compute MiniMol features
+########################################
+# Will create data/stl_split/ with features.pt, targets.pt, metadata.csv
 python minimol_train.py --precompute \
-  --input_tsv data.csv \
-  --fingerprint_col SMILES \
-  --target_cols Hit \
-  --output_dir train
+  --input_tsv  data.csv            \
+  --target_cols Hit                \
+  --output_dir data/stl_split
 
-python minimol_train.py --precompute \
-  --input_tsv data.csv \
-  --fingerprint_col SMILES \
-  --target_cols Hit \
-  --output_dir val \
-  --rows 2:3
-
-python minimol_train.py --precompute \
-  --input_tsv data.csv \
-  --fingerprint_col SMILES \
-  --target_cols Hit \
-  --output_dir test \
-  --rows 3:
-
-# 2) Train + Hyperopt
+########################################
+# 2) Hyper-parameter search (Optuna)
+########################################
 python minimol_train.py \
   --mode stl \
-  --train_dir train \
-  --val_dir val \
-  --test_dir test \
-  --hyperopt \
-  --hyperopt_num_samples 20 \
-  --max_epochs 5 \
-  --cpus_per_trial 1
+  --train_dir data/stl_split        \
+  --hyperopt                       \
+  --n_trials 30                    \   # was --hyperopt_num_samples
+  --max_epochs 5                   \
+  --monitor_metric auprc           \   # optimise validation AUPRC
+  --use_residual                       # ← search the residual architecture
+# ⤷ Best trial parameters & checkpoint are logged under ./optuna_checkpoints/
 
-# 3) Pick best & predict
-BEST=$(ls -t ray_results/*/checkpoint_*/*.ckpt | head -n1)
+########################################
+# 3) Pick best checkpoint & predict
+########################################
+BEST=$(ls -t optuna_checkpoints/single_run/*.ckpt | head -n1)
+
 python minimol_predict.py predict-csv \
-  --input test.csv \
-  --smiles-col SMILES \
-  --checkpoint $BEST \
-  --mode stl \
-  --output preds.csv
+  --input  data.csv                 \
+  --smiles-col SMILES               \
+  --checkpoint "$BEST"              \
+  --mode stl                        \
+  --output preds_stl.csv
+
 ```
-Here a python example with hyperparameter optimization: 
+No explicit val_dir given → Lightning’s PrecomputedDataModule automatically withholds 20 % for validation at run-time. AUPRC on that split drives checkpointing & Optuna pruning.
+
+Here is a python example for a standard MTL model (3 tasks) where the 2nd task is monitored via loss. An ensemble of 3 models are trained, each with a different seed (handled internally) We use a user-defined split here. 
 
 ```python
-import pandas as pd, glob, os
+"""
+End-to-end: 3-task MTL, task-2 loss monitored, *ensemble of 3* models.
+Assumes data.csv with columns: SMILES, Task0, Task1, Task2
+"""
+import os, glob, pandas as pd
 from minimol_dataset import precompute_features
-from minimol_train   import train_model, run_hyperopt
+from minimol_train   import run_hyperopt, train_model
 from minimol_predict import predict_df
 
-# Split & precompute
+# ──────────────────────────────────────────────────────────────
+# 1) Split CSV → train / val / test
+# ──────────────────────────────────────────────────────────────
 df = pd.read_csv("data.csv")
-splits = {
-  "train": df.iloc[:2],
-  "val":   df.iloc[2:3],
-  "test":  df.iloc[3:]
-}
-for name, split in splits.items():
-    precompute_features(split, name, smiles_col="SMILES", target_cols=["Hit"], standardize_smiles=True)
+n  = len(df)
+train_df = df.iloc[:int(0.7*n)]
+val_df   = df.iloc[int(0.7*n):int(0.85*n)]
+test_df  = df.iloc[int(0.85*n):]
 
-# Hyperopt
-best_cfg = run_hyperopt("train","val","test", mode="stl", max_epochs=5, hyperopt_num_samples=20)
-print("Best:", best_cfg)
+# ──────────────────────────────────────────────────────────────
+# 2) Pre-compute MiniMol tensors for every split
+# ──────────────────────────────────────────────────────────────
+for name, split in {"train":train_df, "val":val_df, "test":test_df}.items():
+    precompute_features(
+        input_data = split,
+        output_dir = f"data/mtl_{name}",
+        smiles_col = "SMILES",
+        target_cols= ["Task0", "Task1", "Task2"],
+        standardize_smiles = True
+    )
 
-# Find best checkpoint
-ckpts = glob.glob(os.path.join("ray_results","*","checkpoint_*","*.ckpt"))
-best_ckpt = max(ckpts, key=os.path.getmtime)
+# ──────────────────────────────────────────────────────────────
+# 3) Hyper-opt (single model) to get best hyper-params
+# ──────────────────────────────────────────────────────────────
+best_params = run_hyperopt(
+    train_dir   = "data/mtl_train",
+    val_dir     = "data/mtl_val",
+    mode        = "mtl",
+    max_epochs  = 8,
+    n_trials    = 25,
+    monitor_metric = "loss",   # minimise BCE loss
+    monitor_task   = 2         # watch Task-2
+)
+print("🏆 Optuna best:", best_params)
 
-# Predict
-df_test = splits["test"][["SMILES"]]
-out = predict_df(df_test, "SMILES", best_ckpt, mode="stl", aggregated=False)
-print(out)
+# ──────────────────────────────────────────────────────────────
+# 4) Train an *ensemble* of 3 models with those params
+# ──────────────────────────────────────────────────────────────
+ckpt_dir   = "checkpoints/mtl_ensemble"
+ckpt_paths = []
+
+for idx in range(3):                       # ensemble of 3
+    ckpt = train_model(
+        config         = {**best_params, "use_residual": False},
+        train_dir      = "data/mtl_train",
+        val_dir        = "data/mtl_val",
+        test_dir       = "data/mtl_test",
+        ckpt_root      = ckpt_dir,         # each member goes to ckpt_dir/ensemble_{idx}
+        mode           = "mtl",
+        max_epochs     = 15,
+        monitor_metric = "loss",
+        monitor_task   = 2,
+        early_stop     = True,
+        ensemble_size  = 3,                # inform Lightning callbacks
+        ensemble_idx   = idx               # seed offset
+    )
+    ckpt_paths.append(ckpt)
+
+print("✓ Ensemble checkpoints:", *ckpt_paths, sep="\n  ")
+
+# ──────────────────────────────────────────────────────────────
+# 5) Predict on the held-out test split, averaging the ensemble
+# ──────────────────────────────────────────────────────────────
+preds = predict_df(
+    test_df[["SMILES"]],
+    smiles_col   = "SMILES",
+    checkpoints  = ckpt_paths,   # list → automatic mean / std
+    mode         = "mtl",
+    aggregated   = True          # adds pred_mean_task_k / pred_std_task_k
+)
+
+preds.to_csv("preds_mtl_ensemble.csv", index=False)
+print(preds.head())
 ```
+This pattern scales to any ensemble size—just change the range() and ensemble_size arguments.
