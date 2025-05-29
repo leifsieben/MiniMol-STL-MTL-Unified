@@ -277,9 +277,11 @@ def run_hyperopt(
     n_trials: int = 50,
     n_jobs: int = 1,
     storage_url: str = 'sqlite:///optuna.db',
+    ckpt_root: str | None = None,
     study_name: str = "minimol_study", 
     use_residual: bool = False,
 ):
+    ckpt_root = ckpt_root or "./optuna_checkpoints"   # fallback
     direction = "minimize" if monitor_metric == "loss" else "maximize"
     study = optuna.create_study(
         study_name=study_name,
@@ -314,12 +316,13 @@ def run_hyperopt(
             "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.1, 0.9),
             "loss_type": "bce_with_logits",
         }
-
+        
+        trial_ckpt_root = Path(ckpt_root) / f"trial_{trial.number}"
         best_metric = train_model(
             config=cfg,
             train_dir=train_dir,
             val_dir=val_dir,
-            ckpt_root="./optuna_checkpoints",
+            ckpt_root=str(trial_ckpt_root),
             mode=mode,
             max_epochs=max_epochs,
             num_workers=num_workers,
